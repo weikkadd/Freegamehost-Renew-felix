@@ -6,6 +6,7 @@ on:
 jobs:
   run_fgh_renew:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: 📥 下载私库脚本
         uses: actions/checkout@v4
@@ -18,7 +19,7 @@ jobs:
         run: mv private/renew.py renew.py
 
       - name: 🐍 设置 Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
@@ -27,26 +28,26 @@ jobs:
         env:
           GOST_PROXY: ${{ secrets.GOST_PROXY }}
         run: |
-          VERSION=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
+          VERSION=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest \
+            | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
           echo "📦 GOST 版本: $VERSION"
           wget -q "https://github.com/ginuerzh/gost/releases/download/v${VERSION}/gost_${VERSION}_linux_amd64.tar.gz"
           tar -xzf "gost_${VERSION}_linux_amd64.tar.gz"
           chmod +x gost
           nohup ./gost -L http://:8080 -F "$GOST_PROXY" > gost.log 2>&1 &
           sleep 3
-          IP=$(curl -s -x http://127.0.0.1:8080 https://api.ipify.org)
-          IP_MASKED=$(echo "$IP" | sed 's/\([0-9]*\.[0-9]*\.[0-9]*\.\)[0-9]*/\1xx/')
-          echo "✅ GOST 已启动，出口IP确认：$IP_MASKED"
+          echo "✅ GOST 已启动，测试连通性..."
+          curl -s -x http://127.0.0.1:8080 https://api.ipify.org \
+            | sed 's/\([0-9]*\.[0-9]*\.\)[0-9]*\.\([0-9]*\)/\1**.**/g'
 
       - name: 🛠️ 安装系统依赖
         run: |
-          sudo apt-get update
+          sudo apt-get update -q
           sudo apt-get install -y \
             google-chrome-stable \
             xvfb \
             x11-utils \
-            xdotool \
-            scrot
+            xdotool
 
       - name: 🐍 安装 Python 依赖
         run: |
@@ -56,7 +57,7 @@ jobs:
       - name: 🚀 运行脚本
         env:
           PYTHONIOENCODING: utf-8
-          FGH_ACCOUNT: ${{ secrets.FGH_ACCOUNT }}
+          FGH_COOKIE: ${{ secrets.FGH_COOKIE }}
           GOST_PROXY: ${{ secrets.GOST_PROXY }}
           TG_BOT: ${{ secrets.TG_BOT }}
         run: |
