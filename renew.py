@@ -1238,6 +1238,43 @@ def main():
                     if not rotate_proxy():
                         log("Proxy rotation failed, retrying with same proxy", "WARN")
                         time.sleep(5)
+                        continue
+                    # CRITICAL: Chrome's --proxy-server arg is set at startup.
+                    # Switching xray's outbound doesn't change Chrome's connection.
+                    # We must restart Chrome so it picks up the new proxy config.
+                    # The socks5 listener URL (127.0.0.1:10808) stays the same —
+                    # but xray now routes to a different upstream node.
+                    # Actually, since xray's listener is the same and we just
+                    # replaced its outbound config, existing connections might
+                    # still use old node. But Chrome opens NEW connections for
+                    # each request, so it should pick up the new outbound.
+                    # Still, to be safe, we restart Chrome.
+                    try:
+                        page.quit()
+                    except Exception:
+                        pass
+                    time.sleep(2)
+                    # Recreate Chrome with same options (proxy URL unchanged)
+                    co_new = ChromiumOptions()
+                    co_new.set_browser_path('/usr/bin/google-chrome')
+                    co_new.set_argument('--no-sandbox')
+                    co_new.set_argument('--disable-dev-shm-usage')
+                    co_new.set_argument('--disable-gpu')
+                    co_new.set_argument('--disable-setuid-sandbox')
+                    co_new.set_argument('--disable-software-rasterizer')
+                    co_new.set_argument('--disable-extensions')
+                    co_new.set_argument('--no-first-run')
+                    co_new.set_argument('--no-default-browser-check')
+                    co_new.set_argument('--window-size=1920,1080')
+                    co_new.set_argument('--log-level=3')
+                    if _proxy_manager and _proxy_manager.xray_proc:
+                        co_new.set_argument(f'--proxy-server={_proxy_manager.get_socks5_url()}')
+                        log(f"Chrome restarted with proxy: {_proxy_manager.get_socks5_url()}")
+                    co_new.headless(False)
+                    page = ChromiumPage(co_new)
+                    page.run_js("""
+                        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    """)
                     continue
                 else:
                     error_msg = "Max proxy rotations reached, Google reCAPTCHA still blocking"
