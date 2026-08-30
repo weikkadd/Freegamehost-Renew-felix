@@ -5,7 +5,8 @@ FreeGameHost.xyz 自动续期脚本
 环境变量:
   FGH_ACCOUNT  — 必填，格式: email,password
   BROWSER_PROXY — 可选，浏览器使用的代理（如 http://127.0.0.1:8080）
-  GOST_PROXY   — 可选，上游代理（当 BROWSER_PROXY 未设置时使用）
+                  设为空字符串表示不使用代理
+  GOST_PROXY   — 可选，上游代理（当 BROWSER_PROXY 未设置且非空时使用）
   TG_BOT       — 可选，格式: chat_id,bot_token
 """
 
@@ -74,15 +75,26 @@ def main():
         tg_chat_id, tg_bot_token = tg[0], tg[1]
 
     # ── 代理设置 ──
-    browser_proxy = os.environ.get("BROWSER_PROXY", "").strip() or None
-    raw_gost = os.environ.get("GOST_PROXY", "").strip() or None
-    gost_proxy = clean_proxy(raw_gost) if raw_gost else None
-
-    proxy_arg = browser_proxy or gost_proxy
-    if proxy_arg:
+    # BROWSER_PROXY 显式控制是否使用代理：
+    # - 有值 → 使用该代理
+    # - 空字符串 → 不使用代理（直连）
+    # - 未设置 → 回退到 GOST_PROXY
+    browser_proxy_env = os.environ.get("BROWSER_PROXY", None)
+    if browser_proxy_env is not None and browser_proxy_env.strip() == "":
+        # 显式设置为空，不使用代理
+        proxy_arg = None
+        log("⚠️ BROWSER_PROXY 已设为空，使用直连模式")
+    elif browser_proxy_env:
+        proxy_arg = browser_proxy_env.strip()
         log(f"使用代理: {proxy_arg}")
     else:
-        log("⚠️ 未配置代理，使用直连模式")
+        # 回退到 GOST_PROXY
+        raw_gost = os.environ.get("GOST_PROXY", "").strip() or None
+        proxy_arg = clean_proxy(raw_gost) if raw_gost else None
+        if proxy_arg:
+            log(f"使用代理: {proxy_arg}")
+        else:
+            log("⚠️ 未配置代理，使用直连模式")
 
     # ── 启动浏览器 ──
     sb_kwargs = dict(
