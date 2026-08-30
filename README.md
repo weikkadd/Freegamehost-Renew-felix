@@ -5,7 +5,7 @@
 ## ⭐ 功能特性
 
 - 🔓 **全自动 reCAPTCHA 破解** — 音频识别 + 自动填写，无需人工干预
-- 🌐 **智能代理轮换** — 检测到 Google 封锁后自动切换到下一个 v2rayN 代理节点（支持 vless/vmess/trojan/ss）
+- 🌐 **智能代理轮换** — 检测到 Google 封锁后自动切换到下一个 v2rayN 代理节点（支持 vless/vmess/trojan/ss/hysteria2/hysteria）
 - 📱 **Telegram 通知** — 续期成功/失败均推送消息，附带页面截图
 - ⏰ **定时 + 手动运行** — 默认每 4 小时自动执行，也支持手动触发
 - 🧹 **自动清理运行记录** — 只保留最近 2 条 Actions 记录，仓库保持清爽
@@ -34,6 +34,8 @@
 | **VMess** | `vmess://` | `vmess://eyJ2IjoiMiIsImFkZCI6...`（base64 编码 JSON） |
 | **Trojan** | `trojan://` | `trojan://password@host:443?sni=host.com#name` |
 | **Shadowsocks** | `ss://` | `ss://aes-256-gcm:password@host:8388#name` |
+| **Hysteria2** | `hysteria2://` 或 `hy2://` | `hysteria2://password@host:443?sni=host.com&insecure=1#name` |
+| **Hysteria (v1)** | `hysteria://` | `hysteria://password@host:443?sni=host.com#name` |
 
 **多节点轮换**：用换行符（在 GitHub Secrets 输入框里直接回车）分隔多个链接，reCAPTCHA 被封时自动切换下一个节点。
 
@@ -84,11 +86,11 @@ Fork 本仓库并完成 Secrets 配置后，工作流会按以下时间自动执
 
 ### 2. IP 被封锁导致无法继续？
 
-当检测到 Google reCAPTCHA 封锁（verify button 长期 disabled）时，脚本会自动调用 `xray-core` 切换到下一个 `PROXY_URI` 节点，重启 Chrome 后重新尝试续期。整个流程最多尝试 **5 次** 代理切换。
+当检测到 Google reCAPTCHA 封锁（verify button 长期 disabled）时，脚本会自动调用 `sing-box` 切换到下一个 `PROXY_URI` 节点，重启 Chrome 后重新尝试续期。整个流程最多尝试 **5 次** 代理切换。
 
 ### 3. 为什么需要代理？
 
-FreeGameHost 面板嵌入了 Google reCAPTCHA。当短时间内多次尝试验证时，Google 可能会封禁当前 IP。`PROXY_URI` 接受 v2rayN 客户端链接格式，通过 `xray-core` 在本地启动 socks5 代理，Chrome 通过该代理访问面板。被封后自动切换到下一个节点，每个节点都有独立的出口 IP。
+FreeGameHost 面板嵌入了 Google reCAPTCHA。当短时间内多次尝试验证时，Google 可能会封禁当前 IP。`PROXY_URI` 接受 v2rayN 客户端链接格式，通过 `sing-box` 在本地启动 socks5 代理，Chrome 通过该代理访问面板。被封后自动切换到下一个节点，每个节点都有独立的出口 IP。
 
 ### 4. 没有收到 Telegram 通知？
 

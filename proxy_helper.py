@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-v2rayN proxy helper: parse proxy URI and manage xray-core process.
+v2rayN proxy helper: parse proxy URI and manage sing-box process.
 
 Supports:
   - vless://uuid@host:port?...#name
   - vmess://base64-json
   - trojan://password@host:port?...#name
-  - ss://method:password@host:port#name  (or base64(method:password)@host:port)
+  - ss://method:password@host:port#name  (Shadowsocks)
+  - hysteria2://password@host:port?...#name  (hy2:// also accepted)
+  - hysteria://password@host:port?...#name
+
+Uses sing-box as backend (supports all protocols above natively).
 
 Usage:
   from proxy_helper import ProxyManager
   pm = ProxyManager()
-  pm.start("vless://...")  # Start xray with this proxy
+  pm.start("hysteria2://...")  # Start sing-box with this proxy
   # Browser uses socks5://127.0.0.1:10808
   pm.stop()
   pm.rotate()  # Switch to next proxy in list
@@ -27,7 +31,7 @@ import shutil
 import base64
 import subprocess
 import urllib.parse
-from typing import Optional, List, Tuple
+from typing import Optional, List
 
 
 def log(msg, level="INFO"):
@@ -35,15 +39,15 @@ def log(msg, level="INFO"):
     print(f"{prefix} {msg}", flush=True)
 
 
-# Find xray binary
-def find_xray() -> str:
-    """Find xray binary. Tries common paths."""
+# Find sing-box binary
+def find_singbox() -> str:
+    """Find sing-box binary. Tries common paths."""
     for path in [
-        shutil.which('xray'),
-        '/usr/local/bin/xray',
-        '/usr/bin/xray',
-        os.path.expanduser('~/xray'),
-        '/tmp/xray',
+        shutil.which('sing-box'),
+        '/usr/local/bin/sing-box',
+        '/usr/bin/sing-box',
+        os.path.expanduser('~/sing-box'),
+        '/tmp/sing-box',
     ]:
         if path and os.path.isfile(path) and os.access(path, os.X_OK):
             return path
@@ -54,27 +58,22 @@ def parse_vless(uri: str) -> dict:
     """Parse vless://uuid@host:port?type=...&security=...&sni=...#name"""
     if not uri.startswith('vless://'):
         raise ValueError(f"Not a vless URI: {uri[:30]}")
-    # Strip vless://
     rest = uri[len('vless://'):]
-    # Split fragment
     if '#' in rest:
         rest, fragment = rest.split('#', 1)
         fragment = urllib.parse.unquote(fragment)
     else:
         fragment = ''
-    # Split query
     if '?' in rest:
         main, query = rest.split('?', 1)
         params = dict(urllib.parse.parse_qsl(query))
     else:
         main = rest
         params = {}
-    # Split userinfo@hostport
     if '@' in main:
         uuid, hostport = main.rsplit('@', 1)
     else:
         raise ValueError(f"vless URI missing userinfo: {uri[:50]}")
-    # Split host:port
     if ':' in hostport:
         host, port = hostport.rsplit(':', 1)
         port = int(port)
@@ -96,14 +95,12 @@ def parse_vmess(uri: str) -> dict:
     if not uri.startswith('vmess://'):
         raise ValueError(f"Not a vmess URI: {uri[:30]}")
     b64 = uri[len('vmess://'):]
-    # Fix padding
     b64 += '=' * (-len(b64) % 4)
     try:
         json_str = base64.b64decode(b64).decode('utf-8')
         cfg = json.loads(json_str)
     except Exception as e:
         raise ValueError(f"Failed to decode vmess base64: {e}")
-    # vmess JSON: {"v":"2","ps":"name","add":"host","port":"443","id":"uuid","aid":"0","net":"ws","type":"none","host":"","path":"/","tls":"tls","sni":""}
     return {
         'protocol': 'vmess',
         'uuid': cfg.get('id', ''),
@@ -166,13 +163,8 @@ def parse_ss(uri: str) -> dict:
         fragment = urllib.parse.unquote(fragment)
     else:
         fragment = ''
-    # Two formats:
-    # 1. ss://base64#name  (base64 = method:password@host:port)
-    # 2. ss://method:password@host:port#name
     if '@' in rest:
-        # Format 2
         userinfo, hostport = rest.rsplit('@', 1)
-        # Try to decode as base64 first (SIP002 format)
         try:
             decoded = base64.urlsafe_b64decode(userinfo + '=' * (-len(userinfo) % 4)).decode('utf-8')
             if ':' in decoded:
@@ -183,7 +175,6 @@ def parse_ss(uri: str) -> dict:
             raise ValueError(f"ss URI missing method:password: {uri[:50]}")
         method, password = userinfo.split(':', 1)
     else:
-        # Format 1: pure base64
         try:
             decoded = base64.urlsafe_b64decode(rest + '=' * (-len(rest) % 4)).decode('utf-8')
             userinfo, hostport = decoded.rsplit('@', 1)
@@ -205,6 +196,83 @@ def parse_ss(uri: str) -> dict:
     }
 
 
+def parse_hysteria2(uri: str) -> dict:
+    """Parse hysteria2://password@host:port?...#name (also accepts hy2://)"""
+    if uri.startswith('hysteria2://'):
+        rest = uri[len('hysteria2://'):]
+    elif uri.startswith('hy2://'):
+        rest = uri[len('hy2://'):]
+    else:
+        raise ValueError(f"Not a hysteria2 URI: {uri[:30]}")
+    if '#' in rest:
+        rest, fragment = rest.split('#', 1)
+        fragment = urllib.parse.unquote(fragment)
+    else:
+        fragment = ''
+    if '?' in rest:
+        main, query = rest.split('?', 1)
+        params = dict(urllib.parse.parse_qsl(query))
+    else:
+        main = rest
+        params = {}
+    if '@' in main:
+        password, hostport = main.rsplit('@', 1)
+        password = urllib.parse.unquote(password)
+    else:
+        raise ValueError(f"hysteria2 URI missing password: {uri[:50]}")
+    if ':' in hostport:
+        host, port = hostport.rsplit(':', 1)
+        port = int(port)
+    else:
+        host = hostport
+        port = 443
+    return {
+        'protocol': 'hysteria2',
+        'password': password,
+        'host': host,
+        'port': port,
+        'params': params,
+        'name': fragment,
+    }
+
+
+def parse_hysteria(uri: str) -> dict:
+    """Parse hysteria://password@host:port?...#name (v1, legacy)"""
+    if not uri.startswith('hysteria://'):
+        raise ValueError(f"Not a hysteria URI: {uri[:30]}")
+    rest = uri[len('hysteria://'):]
+    if '#' in rest:
+        rest, fragment = rest.split('#', 1)
+        fragment = urllib.parse.unquote(fragment)
+    else:
+        fragment = ''
+    if '?' in rest:
+        main, query = rest.split('?', 1)
+        params = dict(urllib.parse.parse_qsl(query))
+    else:
+        main = rest
+        params = {}
+    if '@' in main:
+        password, hostport = main.rsplit('@', 1)
+        password = urllib.parse.unquote(password)
+    else:
+        raise ValueError(f"hysteria URI missing password: {uri[:50]}")
+    if ':' in hostport:
+        host, port = hostport.rsplit(':', 1)
+        port = int(port)
+    else:
+        host = hostport
+        port = 443
+    return {
+        'protocol': 'hysteria',
+        'auth_str': password,
+        'host': host,
+        'port': port,
+        'params': params,
+        'name': fragment,
+    }
+
+
 def parse_proxy_uri(uri: str) -> dict:
     """Parse any supported proxy URI. Returns dict with at least 'protocol', 'host', 'port'."""
     uri = uri.strip()
@@ -218,187 +286,218 @@ def parse_proxy_uri(uri: str) -> dict:
         return parse_trojan(uri)
     elif uri.startswith('ss://'):
         return parse_ss(uri)
+    elif uri.startswith('hysteria2://') or uri.startswith('hy2://'):
+        return parse_hysteria2(uri)
+    elif uri.startswith('hysteria://'):
+        return parse_hysteria(uri)
     else:
         raise ValueError(f"Unsupported protocol: {uri[:30]}")
 
 
-def build_xray_config(proxy: dict, listen_port: int = 10808) -> dict:
-    """Build xray-core JSON config for given proxy.
+def build_singbox_config(proxy: dict, listen_port: int = 10808) -> dict:
+    """Build sing-box JSON config for given proxy.
     
-    Always listens as socks5://127.0.0.1:listen_port
-    Also exposes http://127.0.0.1:listen_port+1 for HTTP proxy.
+    Always listens as socks5://127.0.0.1:listen_port + http://127.0.0.1:listen_port+1
     """
     inbounds = [
         {
+            "type": "socks",
             "tag": "socks-in",
-            "port": listen_port,
             "listen": "127.0.0.1",
-            "protocol": "socks",
-            "settings": {"auth": "noauth", "udp": True}
+            "listen_port": listen_port,
         },
         {
+            "type": "http",
             "tag": "http-in",
-            "port": listen_port + 1,
             "listen": "127.0.0.1",
-            "protocol": "http",
-            "settings": {}
+            "listen_port": listen_port + 1,
         }
     ]
     
-    outbounds = []
+    outbound = {
+        "tag": "proxy-out",
+    }
     
     if proxy['protocol'] == 'vless':
         params = proxy.get('params', {})
         network = params.get('type', 'tcp')
         security = params.get('security', 'none')
         
-        stream_settings = {
-            "network": network,
-            "security": security,
-        }
-        
+        tls = {}
         if security == 'tls':
-            stream_settings["tlsSettings"] = {
-                "serverName": params.get('sni', proxy['host']),
-                "allowInsecure": params.get('allowInsecure', '0') == '1',
-                "fingerprint": params.get('fp', 'chrome'),
+            tls = {
+                "enabled": True,
+                "server_name": params.get('sni', proxy['host']),
+                "insecure": params.get('allowInsecure', '0') == '1',
+                "utls": {
+                    "enabled": True,
+                    "fingerprint": params.get('fp', 'chrome'),
+                }
             }
         elif security == 'reality':
-            stream_settings["realitySettings"] = {
-                "serverName": params.get('sni', ''),
-                "fingerprint": params.get('fp', 'chrome'),
-                "publicKey": params.get('pbk', ''),
-                "shortId": params.get('sid', ''),
-                "spiderX": params.get('spx', ''),
+            tls = {
+                "enabled": True,
+                "server_name": params.get('sni', ''),
+                "reality": {
+                    "enabled": True,
+                    "public_key": params.get('pbk', ''),
+                    "short_id": params.get('sid', ''),
+                },
+                "utls": {
+                    "enabled": True,
+                    "fingerprint": params.get('fp', 'chrome'),
+                }
             }
         
+        transport = {}
         if network == 'ws':
-            stream_settings["wsSettings"] = {
+            transport = {
+                "type": "ws",
                 "path": params.get('path', '/'),
-                "headers": {"Host": params.get('host', '')} if params.get('host') else {},
             }
+            if params.get('host'):
+                transport["headers"] = {"Host": params['host']}
         elif network == 'grpc':
-            stream_settings["grpcSettings"] = {
-                "serviceName": params.get('serviceName', ''),
+            transport = {
+                "type": "grpc",
+                "service_name": params.get('serviceName', ''),
             }
         
-        outbounds.append({
-            "tag": "proxy",
-            "protocol": "vless",
-            "settings": {
-                "vnext": [{
-                    "address": proxy['host'],
-                    "port": proxy['port'],
-                    "users": [{
-                        "id": proxy['uuid'],
-                        "encryption": "none",
-                        "flow": params.get('flow', ''),
-                    }]
-                }]
-            },
-            "streamSettings": stream_settings,
+        outbound.update({
+            "type": "vless",
+            "server": proxy['host'],
+            "server_port": proxy['port'],
+            "uuid": proxy['uuid'],
+            "flow": params.get('flow', '') or None,
+            "tls": tls if tls else None,
+            "transport": transport if transport else None,
         })
+        # Remove None values
+        outbound = {k: v for k, v in outbound.items() if v is not None}
     
     elif proxy['protocol'] == 'vmess':
-        security = 'tls' if proxy.get('tls') in ('tls', '') and proxy.get('sni') else 'none'
-        stream_settings = {
-            "network": proxy.get('network', 'ws'),
-            "security": security,
-        }
+        security = 'tls' if proxy.get('tls') in ('tls', 'auto') and proxy.get('sni') else 'none'
+        tls = {}
         if security == 'tls':
-            stream_settings["tlsSettings"] = {
-                "serverName": proxy.get('sni', proxy['host']),
-                "allowInsecure": False,
-            }
-        if proxy.get('network') == 'ws':
-            stream_settings["wsSettings"] = {
-                "path": proxy.get('path', '/'),
-                "headers": {"Host": proxy.get('host_header', '')} if proxy.get('host_header') else {},
+            tls = {
+                "enabled": True,
+                "server_name": proxy.get('sni', proxy['host']),
+                "utls": {
+                    "enabled": True,
+                    "fingerprint": "chrome",
+                }
             }
         
-        outbounds.append({
-            "tag": "proxy",
-            "protocol": "vmess",
-            "settings": {
-                "vnext": [{
-                    "address": proxy['host'],
-                    "port": proxy['port'],
-                    "users": [{
-                        "id": proxy['uuid'],
-                        "alterId": int(proxy.get('aid', '0')),
-                        "security": "auto",
-                    }]
-                }]
-            },
-            "streamSettings": stream_settings,
+        transport = {}
+        if proxy.get('network') == 'ws':
+            transport = {
+                "type": "ws",
+                "path": proxy.get('path', '/'),
+            }
+            if proxy.get('host_header'):
+                transport["headers"] = {"Host": proxy['host_header']}
+        
+        outbound.update({
+            "type": "vmess",
+            "server": proxy['host'],
+            "server_port": proxy['port'],
+            "uuid": proxy['uuid'],
+            "alter_id": int(proxy.get('aid', '0')),
+            "security": "auto",
+            "tls": tls if tls else None,
+            "transport": transport if transport else None,
         })
+        outbound = {k: v for k, v in outbound.items() if v is not None}
     
     elif proxy['protocol'] == 'trojan':
         params = proxy.get('params', {})
-        security = 'tls'
-        stream_settings = {
-            "network": params.get('type', 'tcp'),
-            "security": security,
-            "tlsSettings": {
-                "serverName": params.get('sni', proxy['host']),
-                "allowInsecure": params.get('allowInsecure', '0') == '1',
+        tls = {
+            "enabled": True,
+            "server_name": params.get('sni', proxy['host']),
+            "insecure": params.get('allowInsecure', '0') == '1',
+            "utls": {
+                "enabled": True,
                 "fingerprint": params.get('fp', 'chrome'),
-            },
-        }
-        if stream_settings["network"] == 'ws':
-            stream_settings["wsSettings"] = {
-                "path": params.get('path', '/'),
-                "headers": {"Host": params.get('host', '')} if params.get('host') else {},
             }
-        
-        outbounds.append({
-            "tag": "proxy",
-            "protocol": "trojan",
-            "settings": {
-                "servers": [{
-                    "address": proxy['host'],
-                    "port": proxy['port'],
-                    "password": proxy['password'],
-                }]
-            },
-            "streamSettings": stream_settings,
+        }
+        outbound.update({
+            "type": "trojan",
+            "server": proxy['host'],
+            "server_port": proxy['port'],
+            "password": proxy['password'],
+            "tls": tls,
         })
     
     elif proxy['protocol'] == 'shadowsocks':
-        outbounds.append({
-            "tag": "proxy",
-            "protocol": "shadowsocks",
-            "settings": {
-                "servers": [{
-                    "address": proxy['host'],
-                    "port": proxy['port'],
-                    "method": proxy['method'],
-                    "password": proxy['password'],
-                }]
-            },
+        outbound.update({
+            "type": "shadowsocks",
+            "server": proxy['host'],
+            "server_port": proxy['port'],
+            "method": proxy['method'],
+            "password": proxy['password'],
         })
+    
+    elif proxy['protocol'] == 'hysteria2':
+        params = proxy.get('params', {})
+        tls = {
+            "enabled": True,
+            "server_name": params.get('sni', proxy['host']),
+            "insecure": params.get('insecure', '0') == '1' or params.get('allowinsecure', '0') == '1',
+        }
+        outbound.update({
+            "type": "hysteria2",
+            "server": proxy['host'],
+            "server_port": proxy['port'],
+            "password": proxy['password'],
+            "tls": tls,
+        })
+        # Optional: obfs
+        if params.get('obfs'):
+            outbound["obfs"] = {
+                "type": params['obfs'],
+                "password": params.get('obfs-password', ''),
+            }
+    
+    elif proxy['protocol'] == 'hysteria':
+        params = proxy.get('params', {})
+        tls = {
+            "enabled": True,
+            "server_name": params.get('sni', proxy['host']),
+            "insecure": params.get('insecure', '0') == '1',
+        }
+        outbound.update({
+            "type": "hysteria",
+            "server": proxy['host'],
+            "server_port": proxy['port'],
+            "auth_str": proxy['auth_str'],
+            "tls": tls,
+        })
+        # Optional: up/down bandwidth (required by some servers)
+        if params.get('upmbps'):
+            outbound["up_mbps"] = int(params['upmbps'])
+        if params.get('downmbps'):
+            outbound["down_mbps"] = int(params['downmbps'])
     
     else:
         raise ValueError(f"Unsupported protocol: {proxy['protocol']}")
     
-    # Direct outbound for non-proxy traffic (DNS, etc.)
-    outbounds.append({
-        "tag": "direct",
-        "protocol": "freedom",
-        "settings": {}
-    })
+    # Direct outbound for fallback
+    direct_outbound = {
+        "tag": "direct-out",
+        "type": "direct",
+    }
     
-    # Routing: send all traffic through proxy by default
+    # Routing: send all traffic through proxy
     routing = {
         "rules": [
-            {"type": "field", "outboundTag": "proxy", "port": "0-65535"},
+            {"outbound": "proxy-out"},
         ]
     }
     
     return {
-        "log": {"loglevel": "warning"},
+        "log": {"level": "warn", "timestamp": True},
         "inbounds": inbounds,
-        "outbounds": outbounds,
+        "outbounds": [outbound, direct_outbound],
         "routing": routing,
     }
 
@@ -423,7 +522,7 @@ def wait_for_port(host: str, port: int, timeout: float = 15.0) -> bool:
 
 
 class ProxyManager:
-    """Manage xray-core process and proxy rotation.
+    """Manage sing-box process and proxy rotation.
     
     Usage:
         pm = ProxyManager()
@@ -439,8 +538,8 @@ class ProxyManager:
     def __init__(self):
         self.proxies: List[dict] = []
         self.current_idx: int = -1
-        self.xray_path: Optional[str] = find_xray()
-        self.xray_proc: Optional[subprocess.Popen] = None
+        self.singbox_path: Optional[str] = find_singbox()
+        self.singbox_proc: Optional[subprocess.Popen] = None
         self.config_path: Optional[str] = None
     
     def add_proxies_from_env(self, env_var: str = "PROXY_URI") -> int:
@@ -466,75 +565,74 @@ class ProxyManager:
         return len(self.proxies)
     
     def start(self, idx: int = 0) -> bool:
-        """Start xray with proxy at given index. Stops any running xray first."""
+        """Start sing-box with proxy at given index. Stops any running sing-box first."""
         if not self.proxies:
             log("No proxies available", "ERROR")
             return False
         if idx >= len(self.proxies):
             log(f"Proxy index {idx} out of range (have {len(self.proxies)})", "ERROR")
             return False
-        if not self.xray_path:
-            log("xray binary not found", "ERROR")
+        if not self.singbox_path:
+            log("sing-box binary not found", "ERROR")
             return False
         
         self.stop()
         
         proxy = self.proxies[idx]
         self.current_idx = idx
-        log(f"Starting xray with proxy [{idx}]: {proxy['protocol']} → "
+        log(f"Starting sing-box with proxy [{idx}]: {proxy['protocol']} → "
             f"{proxy['host']}:{proxy['port']}")
         
-        config = build_xray_config(proxy, self.LISTEN_PORT)
-        self.config_path = f"/tmp/xray_config_{os.getpid()}.json"
+        config = build_singbox_config(proxy, self.LISTEN_PORT)
+        self.config_path = f"/tmp/singbox_config_{os.getpid()}.json"
         try:
             with open(self.config_path, 'w') as f:
                 json.dump(config, f, indent=2)
         except Exception as e:
-            log(f"Failed to write xray config: {e}", "ERROR")
+            log(f"Failed to write sing-box config: {e}", "ERROR")
             return False
         
-        # Start xray as subprocess
+        # Start sing-box as subprocess
         try:
-            self.xray_proc = subprocess.Popen(
-                [self.xray_path, 'run', '-c', self.config_path],
+            self.singbox_proc = subprocess.Popen(
+                [self.singbox_path, 'run', '-c', self.config_path],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                # Don't capture stdout to avoid blocking
             )
         except Exception as e:
-            log(f"Failed to start xray: {e}", "ERROR")
+            log(f"Failed to start sing-box: {e}", "ERROR")
             return False
         
-        # Wait for xray to be ready (socks5 port should be reachable)
+        # Wait for sing-box to be ready (socks5 port should be reachable)
         if not wait_for_port('127.0.0.1', self.LISTEN_PORT, timeout=10):
-            log("xray failed to start listening on socks5 port", "ERROR")
+            log("sing-box failed to start listening on socks5 port", "ERROR")
             # Read stderr for diagnostics
             try:
-                stderr = self.xray_proc.stderr.read().decode('utf-8', errors='ignore') if self.xray_proc.stderr else ''
+                stderr = self.singbox_proc.stderr.read().decode('utf-8', errors='ignore') if self.singbox_proc.stderr else ''
                 if stderr:
-                    log(f"xray stderr: {stderr[:500]}", "ERROR")
+                    log(f"sing-box stderr: {stderr[:1000]}", "ERROR")
             except Exception:
                 pass
             self.stop()
             return False
         
-        log(f"✓ xray listening on socks5://127.0.0.1:{self.LISTEN_PORT}")
+        log(f"✓ sing-box listening on socks5://127.0.0.1:{self.LISTEN_PORT}")
         return True
     
     def stop(self):
-        """Stop xray process if running."""
-        if self.xray_proc:
+        """Stop sing-box process if running."""
+        if self.singbox_proc:
             try:
-                self.xray_proc.terminate()
+                self.singbox_proc.terminate()
                 try:
-                    self.xray_proc.wait(timeout=5)
+                    self.singbox_proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
-                    self.xray_proc.kill()
-                    self.xray_proc.wait(timeout=2)
+                    self.singbox_proc.kill()
+                    self.singbox_proc.wait(timeout=2)
             except Exception as e:
-                log(f"Error stopping xray: {e}", "WARN")
+                log(f"Error stopping sing-box: {e}", "WARN")
             finally:
-                self.xray_proc = None
+                self.singbox_proc = None
         # Clean up config file
         if self.config_path and os.path.exists(self.config_path):
             try:
@@ -563,17 +661,19 @@ class ProxyManager:
 
 # Self-test
 if __name__ == "__main__":
-    # Test parsing different formats
     test_uris = [
         "vless://abc-uuid@example.com:443?type=ws&security=tls&sni=example.com&path=%2Fpath#Test",
         "trojan://password123@host.com:443?sni=host.com#MyTrojan",
         "ss://aes-256-gcm:password@host.com:8388#Shadowsocks",
+        "hysteria2://b5c445d1-8e59-465f@host.com:443?sni=host.com&insecure=1#MyHysteria2",
+        "hy2://pass@host.com:8443?sni=host.com#Alias",
     ]
     for uri in test_uris:
         try:
             p = parse_proxy_uri(uri)
-            print(f"✓ {p['protocol']}: {p['host']}:{p['port']} ({p.get('name', '')})")
-            cfg = build_xray_config(p)
-            print(f"  Config generated with {len(cfg['outbounds'])} outbounds")
+            print(f"✓ {p['protocol']:12} → {p['host']}:{p['port']} ({p.get('name', '')})")
+            cfg = build_singbox_config(p)
+            out = cfg['outbounds'][0]
+            print(f"  Outbound: type={out.get('type')}, server={out.get('server')}, port={out.get('server_port')}")
         except Exception as e:
             print(f"✗ {uri[:40]}: {e}")

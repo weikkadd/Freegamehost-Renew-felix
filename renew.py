@@ -1066,8 +1066,8 @@ def init_proxy_manager():
     if count == 0:
         log("PROXY_URI not set or no valid proxies parsed — running without proxy", "WARN")
         return False
-    if not _proxy_manager.xray_path:
-        log("xray binary not found — proxy cannot be used", "ERROR")
+    if not _proxy_manager.singbox_path:
+        log("sing-box binary not found — proxy cannot be used", "ERROR")
         return False
     return True
 
@@ -1240,11 +1240,11 @@ def main():
                         time.sleep(5)
                         continue
                     # CRITICAL: Chrome's --proxy-server arg is set at startup.
-                    # Switching xray's outbound doesn't change Chrome's connection.
+                    # Switching sing-box's outbound doesn't change Chrome's connection.
                     # We must restart Chrome so it picks up the new proxy config.
                     # The socks5 listener URL (127.0.0.1:10808) stays the same —
-                    # but xray now routes to a different upstream node.
-                    # Actually, since xray's listener is the same and we just
+                    # but sing-box now routes to a different upstream node.
+                    # Actually, since sing-box's listener is the same and we just
                     # replaced its outbound config, existing connections might
                     # still use old node. But Chrome opens NEW connections for
                     # each request, so it should pick up the new outbound.
@@ -1267,7 +1267,7 @@ def main():
                     co_new.set_argument('--no-default-browser-check')
                     co_new.set_argument('--window-size=1920,1080')
                     co_new.set_argument('--log-level=3')
-                    if _proxy_manager and _proxy_manager.xray_proc:
+                    if _proxy_manager and _proxy_manager.singbox_proc:
                         co_new.set_argument(f'--proxy-server={_proxy_manager.get_socks5_url()}')
                         log(f"Chrome restarted with proxy: {_proxy_manager.get_socks5_url()}")
                     co_new.headless(False)
@@ -1437,7 +1437,7 @@ def main():
         except:
             pass
         vdisplay.stop()
-        # Stop xray if running
+        # Stop sing-box if running
         if _proxy_manager:
             _proxy_manager.stop()
 
