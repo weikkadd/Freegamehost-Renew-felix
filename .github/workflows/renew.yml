@@ -3,8 +3,7 @@ name: FGH-Renew
 on:
   workflow_dispatch:
   schedule:
-    # 每 4 小时运行一次（UTC 时间 0:00, 4:00, 8:00, 12:00, 16:00, 20:00）
-    - cron: '0 */4 * * *'
+    - cron: '25 */4 * * *'
 
 jobs:
   run_fgh_renew:
@@ -15,101 +14,64 @@ jobs:
       - name: 📥 检出仓库代码
         uses: actions/checkout@v4
 
-      - name: 🐍 设置 Python
+      - name: 🐍 设置 Python 环境
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
-
-      - name: 🛡️ 启动 GOST 代理转发
-        env:
-          GOST_PROXY: ${{ secrets.GOST_PROXY }}
-        run: |
-          if [ -z "$GOST_PROXY" ]; then
-            echo "⏭️ 未配置代理"
-            echo "BROWSER_PROXY=" >> $GITHUB_ENV
-            exit 0
-          fi
-          VERSION=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest \
-            | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
-          echo "📦 GOST 版本: $VERSION"
-          wget -q "https://github.com/ginuerzh/gost/releases/download/v${VERSION}/gost_${VERSION}_linux_amd64.tar.gz"
-          tar -xzf "gost_${VERSION}_linux_amd64.tar.gz"
-          chmod +x gost
-          ./gost -V
-          ./gost -L http://:8080 -F "$GOST_PROXY" -D > gost.log 2>&1 &
-          GOST_PID=$!
-          echo "✅ GOST PID: $GOST_PID"
-          sleep 5
-          # 检查 Gost 是否还在运行
-          if ! kill -0 $GOST_PID 2>/dev/null; then
-            echo "❌ GOST 进程已退出！"
-            cat gost.log || true
-            echo "BROWSER_PROXY=" >> $GITHUB_ENV
-            exit 1
-          fi
-          # 测试上游代理
-          echo "🔍 测试上游代理..."
-          RESULT=$(curl -s --max-time 15 -x http://127.0.0.1:8080 https://api.ipify.org 2>/dev/null || echo "")
-          if [ -n "$RESULT" ]; then
-            echo "✅ 代理可用，出口IP: $RESULT"
-            echo "BROWSER_PROXY=http://127.0.0.1:8080" >> $GITHUB_ENV
-          else
-            echo "⚠️ 代理认证失败或超时，将使用直连模式"
-            echo "BROWSER_PROXY=" >> $GITHUB_ENV
-            cat gost.log || true
-          fi
+          python-version: '3.10'
 
       - name: 🛠️ 安装系统依赖
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y \
-            google-chrome-stable \
-            xvfb \
-            x11-utils \
-            xdotool
+          sudo apt-get install -y xvfb ffmpeg unzip curl wget fonts-noto-cjk
+          wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo dpkg -i /tmp/chrome.deb || sudo apt-get install -f -y
 
       - name: 🐍 安装 Python 依赖
         run: |
-          pip install seleniumbase
-          seleniumbase install chromedriver
+          python -m pip install --upgrade pip
+          pip install DrissionPage xvfbwrapper requests SpeechRecognition pydub
+
+      - name: 🌐 启用 WARP 网络
+        uses: fscarmen/warp-on-actions@v1.3
+        with:
+          stack: dual
+          mode: client
 
       - name: 🔍 网络诊断
         run: |
-          echo "🌐 BROWSER_PROXY=${BROWSER_PROXY:-无}"
+          echo "=== DNS 配置 ==="
+          cat /etc/resolv.conf
           echo ""
-          echo "=== 直接访问 FreeGameHost ==="
-          curl -s --max-time 15 https://panel.freegamehost.xyz -o /dev/null -w "HTTP %{http_code}, Time: %{time_total}s\n" || echo "直接访问失败"
-          if [ -n "${BROWSER_PROXY:-}" ]; then
-            echo ""
-            echo "=== 通过 Gost 访问 ==="
-            curl -s --max-time 15 -x "$BROWSER_PROXY" https://panel.freegamehost.xyz -o /dev/null -w "HTTP %{http_code}, Time: %{time_total}s\n" || echo "代理访问失败"
-          fi
+          echo "=== 当前 IP ==="
+          curl -s --max-time 10 https://api.ipify.org && echo
+          curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=' || true
           echo ""
-          echo "=== Gost 日志（最后10行）==="
-          tail -10 gost.log 2>/dev/null || echo "无 gost.log"
+          echo "=== 测试访问 FreeGameHost ==="
+          curl -s --max-time 15 -o /dev/null -w "HTTP %{http_code}, Time: %{time_total}s\n" https://panel.freegamehost.xyz/auth/login
 
       - name: 🚀 运行续期脚本
         env:
           PYTHONIOENCODING: utf-8
-          BROWSER_PROXY: ${{ env.BROWSER_PROXY }}
           FGH_ACCOUNT: ${{ secrets.FGH_ACCOUNT }}
           GOST_PROXY: ${{ secrets.GOST_PROXY }}
-          TG_BOT: ${{ secrets.TG_BOT }}
-        run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
-
-      - name: 📋 收集失败日志
-        if: failure()
-        run: |
-          echo "=== Gost 完整日志 ==="
-          cat gost.log 2>/dev/null || echo "无 gost.log"
-          echo ""
-          echo "=== 进程状态 ==="
-          ps aux | grep -E "(gost|python)" | grep -v grep || true
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
 
       - name: 📸 上传截图
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: debug-screenshots
-          path: "*.png"
+          name: debug-screenshots-${{ github.run_number }}
+          path: output/screenshots/*.png
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: 🧹 清理历史运行记录
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          repository: ${{ github.repository }}
+          delete_workflow_pattern: ${{ github.workflow }}
+          retain_days: 0
+          keep_minimum_runs: 2
