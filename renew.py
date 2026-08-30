@@ -1293,20 +1293,26 @@ def main():
                     log(f"Server {i+1} expires: {old_expire}")
 
                     renew_btn = None
+                    # Multiple selectors for the renew button — case-insensitive
+                    # Button text on freegamehost.xyz is "RENEW +8 HOURS" (all caps)
                     try:
-                        renew_btn = page.ele('xpath://button[contains(text(), "Renew server")]', timeout=3)
-                    except:
+                        renew_btn = page.ele('xpath://button[contains(translate(text(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "renew")]', timeout=3)
+                    except Exception:
                         pass
                     if not renew_btn:
                         try:
-                            renew_btn = page.ele('xpath://button[contains(text(), "Renew")]', timeout=3)
-                        except:
+                            # Try translate() on full text (handles nested elements)
+                            renew_btn = page.ele('xpath://button[contains(translate(., "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "renew")]', timeout=2)
+                        except Exception:
                             pass
                     if not renew_btn:
+                        # Fallback: iterate all buttons, check case-insensitive
                         buttons = page.eles('button')
                         for btn in buttons:
-                            if "Renew" in (btn.text or ""):
+                            btn_text = (btn.text or "")
+                            if "renew" in btn_text.lower():
                                 renew_btn = btn
+                                log(f"Server {i+1} found renew button via fallback: '{btn_text[:50]}'")
                                 break
 
                     if renew_btn:
@@ -1332,10 +1338,27 @@ def main():
                             continue
 
                     confirm_btn = None
+                    # Confirm dialog button (case-insensitive, matches "Renew" / "RENEW" / "Confirm" etc.)
                     try:
-                        confirm_btn = page.ele('xpath://button[normalize-space(text())="Renew"]', timeout=5)
-                    except:
+                        confirm_btn = page.ele('xpath://button[contains(translate(text(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "renew") or contains(translate(text(), "ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz"), "confirm")]', timeout=5)
+                    except Exception:
                         pass
+                    if not confirm_btn:
+                        # Fallback: look for visible confirm dialog buttons
+                        try:
+                            buttons = page.eles('button')
+                            for btn in buttons:
+                                btn_text = (btn.text or "").lower()
+                                if "renew" in btn_text or "confirm" in btn_text or "verify" in btn_text:
+                                    try:
+                                        if btn.states.is_displayed:
+                                            confirm_btn = btn
+                                            log(f"Server {i+1} found confirm button via fallback: '{btn.text[:50]}'")
+                                            break
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            pass
                     if confirm_btn:
                         try:
                             confirm_btn.click()
