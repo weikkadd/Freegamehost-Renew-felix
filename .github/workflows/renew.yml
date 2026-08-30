@@ -8,7 +8,7 @@ on:
 jobs:
   run_fgh_renew:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: 📥 检出仓库代码
