@@ -394,57 +394,121 @@ def get_audio_url(page):
 
 
 def reload_challenge(page):
-    """Reload audio challenge. Returns True if audio URL changed after reload."""
+    """Reload audio challenge. Returns True if audio URL changed after reload.
+    Uses multiple click strategies because the reload button can be stubborn."""
     bframe = find_recaptcha_frame(page, "bframe")
     if not bframe:
         log("reload_challenge: no bframe", "WARN")
         return False
 
     old_url = get_audio_url(page)
+    log(f"reload_challenge: old audio URL = {(old_url or 'None')[:80]}")
 
-    # Try clicking the reload button (native click first, JS click as fallback)
-    clicked = False
-    try:
-        reload_btn = bframe.ele('#recaptcha-reload-button', timeout=2)
-        if reload_btn:
-            try:
-                reload_btn.click()
-                clicked = True
-            except Exception:
-                try:
-                    reload_btn.click(by_js=True)
-                    clicked = True
-                except Exception:
-                    pass
-    except Exception:
-        pass
+    click_strategies = [
+        # Strategy 1: DrissionPage native click with visibility check
+        ('dp-native', lambda: _try_dp_click(bframe, '#recaptcha-reload-button')),
+        # Strategy 2: JS click on the element by ID
+        ('js-id', lambda: bframe.run_js(
+            "const btn = document.querySelector('#recaptcha-reload-button'); "
+            "if (btn) { btn.click(); return true; } return false;"
+        )),
+        # Strategy 3: JS click on the element by button role + reload icon class
+        ('js-role', lambda: bframe.run_js(
+            'const btn = document.querySelector(\'button#recaptcha-reload-button, button[aria-label*="eload"], button[title*="eload"]\'); '
+            'if (btn) { btn.click(); return true; } return false;'
+        )),
+        # Strategy 4: dispatch synthetic MouseEvent (sometimes .click() is intercepted)
+        ('js-mouseevent', lambda: bframe.run_js("""
+            const btn = document.querySelector('#recaptcha-reload-button');
+            if (!btn) return false;
+            const rect = btn.getBoundingClientRect();
+            const evt = new MouseEvent('click', {
+                bubbles: true, cancelable: true, view: window,
+                clientX: rect.left + rect.width / 2,
+                clientY: rect.top + rect.height / 2
+            });
+            btn.dispatchEvent(evt);
+            return true;
+        """)),
+        # Strategy 5: simulate real pointer events (pointerdown + pointerup + click)
+        ('js-pointer', lambda: bframe.run_js("""
+            const btn = document.querySelector('#recaptcha-reload-button');
+            if (!btn) return false;
+            const rect = btn.getBoundingClientRect();
+            const opts = {
+                bubbles: true, cancelable: true, view: window,
+                clientX: rect.left + rect.width / 2,
+                clientY: rect.top + rect.height / 2,
+                button: 0
+            };
+            btn.dispatchEvent(new PointerEvent('pointerdown', opts));
+            btn.dispatchEvent(new MouseEvent('mousedown', opts));
+            btn.dispatchEvent(new PointerEvent('pointerup', opts));
+            btn.dispatchEvent(new MouseEvent('mouseup', opts));
+            btn.dispatchEvent(new MouseEvent('click', opts));
+            return true;
+        """)),
+    ]
 
-    # If native button click failed, force JS click directly on the element
-    if not clicked:
+    clicked_strategy = None
+    for name, fn in click_strategies:
         try:
-            bframe.run_js("document.querySelector('#recaptcha-reload-button')?.click();")
-            clicked = True
-        except Exception:
-            pass
+            result = fn()
+            if result:
+                log(f"reload_challenge: clicked via strategy '{name}'")
+                clicked_strategy = name
+                break
+        except Exception as e:
+            log(f"reload_challenge: strategy '{name}' error: {e}", "WARN")
+            continue
 
-    if not clicked:
-        log("reload_challenge: reload button not found/clicked", "WARN")
+    if not clicked_strategy:
+        log("reload_challenge: all click strategies failed", "WARN")
         return False
 
-    # Wait for the audio URL to change (max 8 seconds)
+    # Wait for the audio URL to change (max 10 seconds)
     new_url = None
-    for _ in range(16):
+    changed = False
+    for i in range(20):
         time.sleep(0.5)
         new_url = get_audio_url(page)
         if new_url and new_url != old_url:
+            changed = True
+            log(f"reload_challenge: audio URL changed after {(i+1)*0.5:.1f}s")
             break
-    else:
-        log("reload_challenge: audio URL did not change after reload", "WARN")
+
+    if not changed:
+        log("reload_challenge: audio URL did not change after 10s (button click may have been intercepted)", "WARN")
         return False
 
     # Give Google a moment to fully load the new audio
     time.sleep(random.uniform(0.5, 1.0))
     return True
+
+
+def _try_dp_click(bframe, selector):
+    """Try DrissionPage native click with visibility check. Returns True if click succeeded."""
+    try:
+        btn = bframe.ele(selector, timeout=1)
+        if not btn:
+            return False
+        # Check visibility
+        try:
+            if hasattr(btn, 'states') and not btn.states.is_displayed:
+                return False
+        except Exception:
+            pass
+        try:
+            btn.click()
+            return True
+        except Exception:
+            try:
+                btn.click(by_js=True)
+                return True
+            except Exception:
+                return False
+    except Exception:
+        return False
 
 
 def fill_and_verify(page, text):
@@ -504,8 +568,21 @@ def recognize_audio(mp3_path):
         return None
     wav_path = mp3_path.replace(".mp3", ".wav")
     try:
-        # Convert with explicit sample rate (reCAPTCHA audio is 48kHz mono)
-        AudioSegment.from_mp3(mp3_path).export(wav_path, format="wav")
+        audio_seg = AudioSegment.from_mp3(mp3_path)
+        # Diagnostic: log audio info
+        duration_s = len(audio_seg) / 1000.0
+        # Use dBFS to check if audio is essentially silent
+        dbfs = audio_seg.dBFS
+        log(f"recognize_audio: audio duration={duration_s:.2f}s, dBFS={dbfs:.1f}, channels={audio_seg.channels}, frame_rate={audio_seg.frame_rate}")
+        # Strip silence from the beginning/end and boost low audio
+        audio_seg = audio_seg.strip_silence(silence_thresh=-40, silence_len=100)
+        # Normalize to -10 dBFS so Google API can hear it well
+        if audio_seg.dBFS < -20:
+            log(f"recognize_audio: audio is quiet ({audio_seg.dBFS:.1f} dBFS), boosting")
+            target_dbfs = -10
+            gain = target_dbfs - audio_seg.dBFS
+            audio_seg = audio_seg.apply_gain(gain)
+        audio_seg.export(wav_path, format="wav")
     except Exception as e:
         log(f"recognize_audio: MP3->WAV conversion failed: {e}", "ERROR")
         return None
@@ -515,9 +592,10 @@ def recognize_audio(mp3_path):
         recognizer = sr.Recognizer()
         # Try multiple strategies to improve recognition accuracy
         strategies = [
-            {"dynamic_energy": True, "adjust_duration": 0.5, "show_all": False},
-            {"dynamic_energy": False, "adjust_duration": 1.0, "show_all": False},
-            {"dynamic_energy": True, "adjust_duration": 0.2, "show_all": True},
+            {"name": "dynamic-0.5s", "dynamic_energy": True, "adjust_duration": 0.5, "show_all": False},
+            {"name": "fixed-300", "dynamic_energy": False, "adjust_duration": 1.0, "show_all": False},
+            {"name": "show-all-best", "dynamic_energy": True, "adjust_duration": 0.3, "show_all": True},
+            {"name": "dynamic-0.1s", "dynamic_energy": True, "adjust_duration": 0.1, "show_all": False},
         ]
         for strat in strategies:
             try:
@@ -532,10 +610,13 @@ def recognize_audio(mp3_path):
                     if strat["show_all"]:
                         alternatives = recognizer.recognize_google(audio_data, show_all=True)
                         if alternatives:
+                            alts = alternatives.get('alternative', [])
+                            for alt_i, alt in enumerate(alts[:3]):
+                                log(f"  alt[{alt_i}]: '{alt.get('transcript', '')}' (conf={alt.get('confidence', 0):.2f})")
                             # Pick the alternative with highest confidence
                             best = None
                             best_conf = 0
-                            for alt in alternatives.get('alternative', []):
+                            for alt in alts:
                                 conf = alt.get('confidence', 0)
                                 if conf >= best_conf and alt.get('transcript'):
                                     best = alt['transcript']
@@ -547,14 +628,16 @@ def recognize_audio(mp3_path):
                         text = recognizer.recognize_google(audio_data)
                         if text:
                             results.append((text, 0.5))
+                            log(f"  strategy '{strat['name']}' result: '{text}'")
                             continue
             except sr.UnknownValueError:
+                log(f"  strategy '{strat['name']}' UnknownValueError", "WARN")
                 continue
             except sr.RequestError as e:
                 log(f"recognize_audio: Google API error: {e}", "WARN")
                 continue
             except Exception as e:
-                log(f"recognize_audio: strategy error: {e}", "WARN")
+                log(f"recognize_audio: strategy '{strat['name']}' error: {e}", "WARN")
                 continue
     finally:
         try:
@@ -663,9 +746,14 @@ def solve_recaptcha(page):
             log("No audio URL found, reloading challenge")
             reload_challenge(page)
             continue
-        # Log audio URL (truncated & masked) for debugging
-        masked_url = audio_url[:60] + "..." if len(audio_url) > 60 else audio_url
-        log(f"Audio URL: {masked_url}")
+        # Log full audio URL for accurate comparison (the p= parameter changes per challenge)
+        # Truncate only for very long URLs
+        if len(audio_url) > 120:
+            log(f"Audio URL: {audio_url[:80]}...{audio_url[-40:]}")
+        else:
+            log(f"Audio URL: {audio_url}")
+        # Log a short hash for quick diff
+        log(f"Audio URL hash: {hash(audio_url) % 100000:05d}")
 
         mp3 = download_audio(audio_url)
         if not mp3:
@@ -696,13 +784,13 @@ def solve_recaptcha(page):
             same_text_streak += 1
             log(f"Same recognition result as last attempt (streak={same_text_streak})", "WARN")
             if same_text_streak >= 2:
-                # Force hard reload: switch back to image mode briefly, then back to audio
-                # This is the most reliable way to get a fresh challenge when reload isn't working
-                log("Hard reset: switching challenge mode to force fresh audio", "WARN")
-                # Click the "Get an audio challenge" button again after reloading
+                # Force hard reset: trigger full execute() to start a completely new challenge cycle
+                log("Hard reset: invoking grecaptcha.execute() to force fresh challenge", "WARN")
                 try_invoke_grecaptcha_execute(page)
-                time.sleep(2)
-                reload_challenge(page)
+                time.sleep(3)
+                # After hard reset, we may need to re-enter audio mode
+                if not is_audio_mode(page):
+                    switch_to_audio(page)
                 last_text = None
                 same_text_streak = 0
                 continue
@@ -715,13 +803,23 @@ def solve_recaptcha(page):
         if is_recaptcha_solved(page):
             return True
 
-        # Reload and verify it actually changed the audio URL
-        if not reload_challenge(page):
-            log("Reload failed to change audio URL; sleeping before next attempt", "WARN")
-            time.sleep(random.uniform(3, 5))
-            # Last resort: re-trigger execute
+        # Reload and verify it actually changed the audio URL — try up to 3 times
+        reload_ok = False
+        for retry_idx in range(3):
+            if reload_challenge(page):
+                reload_ok = True
+                break
+            log(f"Reload retry {retry_idx+1}/3 failed, retrying...", "WARN")
+            time.sleep(random.uniform(2, 4))
+        
+        if not reload_ok:
+            log("All 3 reload attempts failed to change audio URL", "WARN")
+            # Last resort: trigger execute() to start fresh
             try_invoke_grecaptcha_execute(page)
-            time.sleep(2)
+            time.sleep(3)
+            if not is_audio_mode(page):
+                switch_to_audio(page)
+            time.sleep(random.uniform(1, 2))
         else:
             time.sleep(random.uniform(1.5, 3))
 
