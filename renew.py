@@ -32,6 +32,55 @@ MAX_CAPTCHA_ATTEMPTS = 3
 SCREENSHOT_DIR = "output/screenshots"
 
 
+def log(msg, level="INFO"):
+    prefix = {"INFO": "[FGH-Renew]", "WARN": "[WARN]", "ERROR": "[ERROR]"}.get(level, "[FGH-Renew]")
+    print(f"{prefix} {msg}", flush=True)
+
+
+def send_tg(token, chat_id, text):
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+        r = requests.post(url, data=data, timeout=30)
+        r.raise_for_status()
+        log("Telegram notification sent")
+    except Exception as e:
+        log(f"Telegram notification failed: {e}", "ERROR")
+
+
+def mask_url(url):
+    import re
+    return re.sub(r'(\?i=)([^&]{1})([^&]*)', r'\1\2***', url)
+
+
+def get_server_name(page):
+    try:
+        ele = page.ele('#serverName', timeout=2)
+        if ele:
+            return ele.text.strip()
+    except:
+        pass
+    try:
+        ele = page.ele('text:/服务器|server/i', timeout=2)
+        if ele:
+            return ele.text.strip()
+    except:
+        pass
+    return "Unknown"
+
+
+def get_expire_time(page):
+    selectors = ['#expireDate', 'text:Expires in:', 'text:Deletes on:']
+    for sel in selectors:
+        try:
+            ele = page.ele(sel, timeout=2)
+            if ele:
+                return ele.text.strip()
+        except:
+            continue
+    return "Unknown"
+
+
 def fill_login_form(page, email, password):
     """Fill login form - handles SPA/iframe content"""
     log("Filling login info...")
@@ -147,55 +196,6 @@ def debug_page(page):
         log(f"Failed to get frames: {e}", "WARN")
     
     log("=" * 50)
-
-
-def log(msg, level="INFO"):
-    prefix = {"INFO": "[FGH-Renew]", "WARN": "[WARN]", "ERROR": "[ERROR]"}.get(level, "[FGH-Renew]")
-    print(f"{prefix} {msg}", flush=True)
-
-
-def send_tg(token, chat_id, text):
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-        r = requests.post(url, data=data, timeout=30)
-        r.raise_for_status()
-        log("Telegram notification sent")
-    except Exception as e:
-        log(f"Telegram notification failed: {e}", "ERROR")
-
-
-def mask_url(url):
-    import re
-    return re.sub(r'(\?i=)([^&]{1})([^&]*)', r'\1\2***', url)
-
-
-def get_server_name(page):
-    try:
-        ele = page.ele('#serverName', timeout=2)
-        if ele:
-            return ele.text.strip()
-    except:
-        pass
-    try:
-        ele = page.ele('text:/服务器|server/i', timeout=2)
-        if ele:
-            return ele.text.strip()
-    except:
-        pass
-    return "Unknown"
-
-
-def get_expire_time(page):
-    selectors = ['#expireDate', 'text:Expires in:', 'text:Deletes on:']
-    for sel in selectors:
-        try:
-            ele = page.ele(sel, timeout=2)
-            if ele:
-                return ele.text.strip()
-        except:
-            continue
-    return "Unknown"
 
 
 # reCAPTCHA functions
@@ -582,36 +582,22 @@ def main():
         
         # Check if page loaded correctly
         current_url = page.url
-        page_text = page.html[:2000] if page.html else ""
         log(f"Current URL: {current_url}")
         
         # Debug page content
         debug_page(page)
         
         # If stuck on Cloudflare challenge, wait more
+        page_text = page.get_text()
         if "cloudflare" in current_url.lower() or "attention required" in page_text.lower():
             log("Cloudflare challenge detected, waiting...", "WARN")
             time.sleep(10)
             page.get(f"{PANEL_URL}/auth/login")
             time.sleep(15)
+            debug_page(page)
 
         # Fill credentials using enhanced function
         fill_login_form(page, email, password)
-            log("Failed to fill login form, trying JS injection...", "WARN")
-            # Fallback: use JS to fill
-            page.run_js(f"""
-                const inputs = document.querySelectorAll('input');
-                inputs.forEach(inp => {{
-                    if (inp.type === 'email' || inp.type === 'text') {{
-                        inp.value = '{email}';
-                        inp.dispatchEvent(new Event('input', {{bubbles: true}}));
-                    }} else if (inp.type === 'password') {{
-                        inp.value = '{password}';
-                        inp.dispatchEvent(new Event('input', {{bubbles: true}}));
-                    }}
-                }});
-            """)
-            log("Tried JS injection fallback")
 
         # Click login
         log("Clicking login button...")
