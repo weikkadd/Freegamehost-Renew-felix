@@ -76,7 +76,6 @@ def main():
         browser="chrome",
         headless=True,
         proxy=proxy_arg,
-        slowmo=0,
         gui=False,
     ) as sb:
 
