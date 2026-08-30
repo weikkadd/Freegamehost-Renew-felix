@@ -35,6 +35,13 @@ ATTEMPT_TIMEOUT_S = 60         # Max time for a single solve_recaptcha attempt
 SOLVE_TOTAL_TIMEOUT_S = 480    # Max total time for solve_recaptcha (8 min)
 
 
+class BlockedError(Exception):
+    """Raised when Google has permanently blocked our solving attempts (verify button
+    stuck disabled for >5s after submitting answer). This should trigger WARP IP
+    rotation in the caller."""
+    pass
+
+
 def log(msg, level="INFO"):
     prefix = {"INFO": "[FGH-Renew]", "WARN": "[WARN]", "ERROR": "[ERROR]"}.get(level, "[FGH-Renew]")
     print(f"{prefix} {msg}", flush=True)
@@ -181,15 +188,32 @@ def is_recaptcha_solved(page):
 
 
 def is_blocked(page):
+    """Check if Google has permanently blocked our solving attempts.
+    
+    Two states are considered blocked:
+    1. The 'doscaptcha' page (Try again later) — explicit block
+    2. ALL bframe buttons disabled — implicit block when verify button stays disabled
+       after we've already submitted an answer (Google is preventing further attempts)
+    """
     bframe = find_recaptcha_frame(page, "bframe")
     if not bframe:
         return False
     try:
         return bool(bframe.run_js("""
+            // Check 1: explicit 'try again later' page
             const h = document.querySelector('.rc-doscaptcha-header-text');
             if (h && h.textContent.toLowerCase().includes('try again later')) return true;
             const e = document.querySelector('.rc-audiochallenge-error-message');
             if (e && e.offsetParent !== null) return true;
+            // Check 2: verify button stuck in disabled state with audio-response input present
+            // (means we've already submitted an answer but Google won't let us retry)
+            const verify = document.querySelector('#recaptcha-verify-button');
+            const audioInput = document.querySelector('#audio-response');
+            if (verify && verify.disabled && audioInput && audioInput.value && audioInput.value.length > 0) {
+                // Verify is disabled AND we have submitted text in the input
+                // AND the input is also disabled (typically the case after Verify click)
+                if (audioInput.disabled) return true;
+            }
             return false;
         """))
     except:
@@ -671,10 +695,10 @@ def fill_and_verify(page, text):
     # while Google checks our answer server-side. We must wait for:
     # 1. reCAPTCHA solved → return immediately (best case)
     # 2. Verify button re-enabled → Google rejected our answer, can proceed
-    # 3. Verify button text changes to 'Skip' → indicates too many wrong attempts
+    # 3. Verify button STAYS disabled for >5s → Google has BLOCKED us → raise BlockedError
     log("fill_and_verify: waiting for Google to process verify response...")
     start = time.time()
-    while time.time() - start < 10:
+    while time.time() - start < 5:
         # Best case: solved
         if is_recaptcha_solved(page):
             log(f"fill_and_verify: ✓ reCAPTCHA solved after {time.time()-start:.1f}s")
@@ -699,9 +723,11 @@ def fill_and_verify(page, text):
             pass
         time.sleep(0.25)
     
-    # Timeout: we don't know what happened, just return and let caller handle
-    log("fill_and_verify: timed out waiting for verify button state (10s)", "WARN")
-    return False
+    # Timeout: verify button stayed disabled for >5s
+    # Google has BLOCKED us — raise BlockedError to trigger WARP IP rotation
+    elapsed = time.time() - start
+    log(f"fill_and_verify: verify button stayed disabled for {elapsed:.1f}s — Google has BLOCKED us", "ERROR")
+    raise BlockedError(f"Verify button stuck disabled for {elapsed:.1f}s")
 
 
 def download_audio(url):
@@ -982,24 +1008,33 @@ def solve_recaptcha(page):
         last_text = text
 
         # fill_and_verify now waits for Google to process the answer (1-3s typically)
-        # and returns True if solved, False if answer was rejected
-        verified = fill_and_verify(page, text)
+        # and returns True if solved, False if answer was rejected.
+        # It raises BlockedError if Google has permanently blocked us (verify button
+        # stayed disabled for >5s after submitting answer).
+        try:
+            verified = fill_and_verify(page, text)
+        except BlockedError as e:
+            # Google has BLOCKED us. Stop solving and trigger WARP IP rotation
+            # by raising IP-blocked exception which main() handles by switching IP.
+            log(f"BlockedError: {e} — raising IP-blocked exception to trigger WARP rotation", "ERROR")
+            raise Exception(f"IP blocked by Google reCAPTCHA: {e}")
         if verified:
             return True
         # Brief delay before reload (randomize to avoid pattern detection)
         time.sleep(random.uniform(1.5, 2.5))
 
-        # Reload and verify it actually changed the audio URL — try up to 3 times
+        # Reload and verify it actually changed the audio URL — try up to 2 times
+        # (was 3, but reduced because if reload fails once it usually fails again)
         reload_ok = False
-        for retry_idx in range(3):
+        for retry_idx in range(2):
             if reload_challenge(page):
                 reload_ok = True
                 break
-            log(f"Reload retry {retry_idx+1}/3 failed, retrying...", "WARN")
+            log(f"Reload retry {retry_idx+1}/2 failed, retrying...", "WARN")
             time.sleep(random.uniform(2, 4))
         
         if not reload_ok:
-            log("All 3 reload attempts failed to change audio URL", "WARN")
+            log("All 2 reload attempts failed to change audio URL", "WARN")
             # Last resort: trigger execute() to start fresh
             try_invoke_grecaptcha_execute(page)
             time.sleep(3)
