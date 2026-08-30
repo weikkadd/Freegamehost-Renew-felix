@@ -540,7 +540,7 @@ def main():
         fill_login_form(page, email, password)
 
         log("Clicking login button...")
-        page.run_js('document.querySelector("button[type=submit]")?.click() || document.querySelector("button:contains(LOGIN)")?.click()')
+        page.run_js('document.querySelector("button[type=submit]")?.click()')
 
         time.sleep(10)
         current_url = page.url
