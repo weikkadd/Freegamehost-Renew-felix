@@ -34,11 +34,20 @@ jobs:
           wget -q "https://github.com/ginuerzh/gost/releases/download/v${VERSION}/gost_${VERSION}_linux_amd64.tar.gz"
           tar -xzf "gost_${VERSION}_linux_amd64.tar.gz"
           chmod +x gost
+          ./gost -V
           nohup ./gost -L http://:8080 -F "$GOST_PROXY" > gost.log 2>&1 &
-          sleep 3
-          echo "✅ GOST 已启动，测试连通性..."
-          curl -s -x http://127.0.0.1:8080 https://api.ipify.org \
-            | sed 's/\([0-9]*\.[0-9]*\.\)[0-9]*\.\([0-9]*\)/\1**.**/g'
+          GOST_PID=$!
+          echo "✅ GOST PID: $GOST_PID"
+          sleep 5
+          # 检查 Gost 是否仍在运行
+          if ! kill -0 $GOST_PID 2>/dev/null; then
+            echo "❌ GOST 进程已退出，查看日志："
+            cat gost.log
+            exit 1
+          fi
+          echo "✅ GOST 正在运行，测试连通性..."
+          curl -sv -x http://127.0.0.1:8080 https://api.ipify.org 2>&1 | tail -20
+          echo "🌐 出口IP: $(curl -s -x http://127.0.0.1:8080 https://api.ipify.org 2>/dev/null || echo '无法获取')"
 
       - name: 🛠️ 安装系统依赖
         run: |
@@ -54,6 +63,20 @@ jobs:
           pip install seleniumbase
           seleniumbase install chromedriver
 
+      - name: 🔍 调试网络信息
+        run: |
+          echo "=== GOST 进程 ==="
+          ps aux | grep gost | grep -v grep || echo "GOST 未运行！"
+          echo ""
+          echo "=== 端口监听 ==="
+          netstat -tlnp 2>/dev/null | grep 8080 || ss -tlnp | grep 8080 || echo "8080 端口未监听"
+          echo ""
+          echo "=== GOST 日志（最后20行）==="
+          tail -20 gost.log 2>/dev/null || echo "无 gost.log"
+          echo ""
+          echo "=== 直接访问测试 ==="
+          curl -s --max-time 10 https://panel.freegamehost.xyz -o /dev/null -w "HTTP %{http_code}\n" || echo "直接访问失败"
+
       - name: 🚀 运行续期脚本
         env:
           PYTHONIOENCODING: utf-8
@@ -62,7 +85,20 @@ jobs:
           GOST_PROXY: ${{ secrets.GOST_PROXY }}
           TG_BOT: ${{ secrets.TG_BOT }}
         run: |
+          echo "=== 运行前检查 ==="
+          ps aux | grep gost | grep -v grep || echo "⚠️ GOST 未在运行！"
+          echo ""
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
+          echo "脚本退出码: $?"
+
+      - name: 📋 收集 GOST 日志
+        if: always()
+        run: |
+          echo "=== GOST 完整日志 ==="
+          cat gost.log 2>/dev/null || echo "无 gost.log"
+          echo ""
+          echo "=== 网络状态 ==="
+          netstat -tlnp 2>/dev/null | head -20 || ss -tlnp | head -20
 
       - name: 📸 上传截图
         if: always()
