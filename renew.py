@@ -1048,14 +1048,16 @@ def solve_recaptcha(page):
 
 
 def rotate_warp_ip():
-    """Rotate Cloudflare WARP exit IP by disconnecting and reconnecting.
+    """Rotate Cloudflare WARP exit IP by re-registering WARP account.
     
     Returns True if rotation succeeded AND new IP differs from previous, False otherwise.
-    Used to escape Google reCAPTCHA's IP-based blocking.
     
-    Critical: --accept-tos must come BEFORE the subcommand (verified from fscarmen's action):
-        sudo warp-cli --accept-tos registration new    ← correct
-        warp-cli disconnect --accept-tos                ← WRONG (gives Usage error)
+    IMPORTANT: disconnect+connect does NOT change the exit IP because Cloudflare
+    keeps the same account/IP mapping across reconnects. To actually get a new IP,
+    we must delete the current registration and create a new one:
+      warp-cli registration delete
+      warp-cli registration new
+    This is exactly what fscarmen/warp-on-actions@v1.3 does during initial setup.
     """
     import subprocess
     import shutil
@@ -1064,68 +1066,61 @@ def rotate_warp_ip():
     try:
         r = requests.get("https://api.ipify.org", timeout=10)
         old_ip = r.text.strip()
-        log(f"Rotating WARP IP... (current IP: {old_ip})")
+        log(f"Rotating WARP IP via re-registration... (current IP: {old_ip})")
     except Exception:
         old_ip = None
-        log("Rotating WARP IP... (could not get current IP)")
+        log("Rotating WARP IP via re-registration... (could not get current IP)")
     
-    # Find warp-cli binary (might not be in PATH for non-root users)
+    # Find warp-cli binary
     warp_cli_path = shutil.which('warp-cli') or '/usr/local/bin/warp-cli'
     log(f"  warp-cli path: {warp_cli_path}")
     
     def run_warp_cmd(subcmd):
-        """Run warp-cli <subcmd> with multiple TOS-accept strategies.
-        Returns combined stdout+stderr (empty string if all variants failed)."""
+        """Run 'sudo warp-cli --accept-tos <subcmd>'. Returns output string or '' on failure."""
         env = os.environ.copy()
         env['WARP_CLI_ACCEPT_TOS'] = '1'
-        # Each variant uses CORRECT --accept-tos position (before subcommand)
-        variants = [
-            ['sudo', warp_cli_path, '--accept-tos', subcmd],
-            [warp_cli_path, '--accept-tos', subcmd],
-            ['sudo', warp_cli_path, subcmd],
-            [warp_cli_path, subcmd],
-        ]
-        for i, variant in enumerate(variants):
-            try:
-                log(f"    trying variant {i+1}: {' '.join(variant)}")
-                result = subprocess.run(
-                    variant, env=env, capture_output=True, text=True, timeout=15
-                )
-                output = ((result.stdout or '') + (result.stderr or '')).strip()
-                if output:
-                    log(f"    output: {output[:200]}")
-                # Detect TOS-not-accepted error
-                if 'Terms of Service' in output and 'accept-tos' in output:
-                    log(f"    variant {i+1} hit TOS error, trying next", "WARN")
-                    continue
-                # Detect 'Usage' error (invalid flag)
-                if 'Usage:' in output and 'try \'--help\'' in output:
-                    log(f"    variant {i+1} hit Usage error, trying next", "WARN")
-                    continue
-                # Got some output (success or other error) — return it
-                log(f"    variant {i+1} accepted")
-                return output
-            except subprocess.TimeoutExpired:
-                log(f"    variant {i+1} timed out", "WARN")
-                continue
-            except FileNotFoundError as e:
-                log(f"    variant {i+1} FileNotFoundError: {e}", "WARN")
-                continue
-            except Exception as e:
-                log(f"    variant {i+1} exception: {type(e).__name__}: {e}", "WARN")
-                continue
-        log(f"    all 4 variants failed for '{subcmd}'", "WARN")
-        return ""
+        cmd = ['sudo', warp_cli_path, '--accept-tos'] + subcmd.split()
+        log(f"    running: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(
+                cmd, env=env, capture_output=True, text=True, timeout=30
+            )
+            output = ((result.stdout or '') + (result.stderr or '')).strip()
+            if output:
+                log(f"    output: {output[:200]}")
+            if result.returncode != 0:
+                log(f"    exit code: {result.returncode}", "WARN")
+            return output
+        except subprocess.TimeoutExpired:
+            log(f"    command timed out (30s)", "WARN")
+            return ""
+        except Exception as e:
+            log(f"    exception: {type(e).__name__}: {e}", "WARN")
+            return ""
     
-    # Try rotation up to 3 times until IP actually changes
+    # Re-registration strategy: this is the ONLY reliable way to get a new WARP IP
+    # Steps:
+    #   1. disconnect (clean shutdown)
+    #   2. registration delete (delete current account)
+    #   3. registration new (create new account → Cloudflare assigns new IP)
+    #   4. mode warp+doh (re-apply the mode fscarmen action uses)
+    #   5. connect (start using new registration)
+    #   6. wait for IP to settle
     for attempt in range(3):
         try:
-            log(f"  attempt {attempt+1}/3: disconnecting WARP...")
+            log(f"  attempt {attempt+1}/3: full re-registration cycle...")
             run_warp_cmd('disconnect')
+            time.sleep(2)
+            run_warp_cmd('registration delete')
+            time.sleep(2)
+            run_warp_cmd('registration new')
             time.sleep(3)
-            log(f"  attempt {attempt+1}/3: reconnecting WARP...")
+            # Re-apply mode (registration new resets it)
+            run_warp_cmd('mode warp+doh')
+            time.sleep(1)
             run_warp_cmd('connect')
-            time.sleep(5)
+            time.sleep(8)  # WARP needs time to establish connection
+            
             # Verify new IP
             try:
                 r = requests.get("https://api.ipify.org", timeout=10)
@@ -1134,15 +1129,15 @@ def rotate_warp_ip():
                     log(f"  ✓ WARP IP changed: {old_ip} → {new_ip}")
                     return True
                 else:
-                    log(f"  IP unchanged ({new_ip}), will retry rotation", "WARN")
+                    log(f"  IP unchanged ({new_ip}), will retry re-registration", "WARN")
             except Exception as e:
                 log(f"  failed to verify new IP: {e}", "WARN")
                 return True
         except Exception as e:
-            log(f"  WARP rotation attempt {attempt+1} failed: {e}", "WARN")
-        time.sleep(2)
+            log(f"  WARP re-registration attempt {attempt+1} failed: {e}", "WARN")
+        time.sleep(3)
     
-    log("WARP rotation failed after 3 attempts (IP never changed)", "ERROR")
+    log("WARP rotation failed after 3 re-registration attempts", "ERROR")
     return False
 
 
