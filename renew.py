@@ -203,8 +203,56 @@ def wait_for_frame_ready(frame, timeout=20):
     return False
 
 
+def is_invisible_recaptcha(page):
+    """Detect invisible reCAPTCHA by checking anchor iframe src for size=invisible."""
+    try:
+        for frame in page.get_frames():
+            url = frame.url or ""
+            if "recaptcha" in url and "anchor" in url and "size=invisible" in url:
+                return True
+    except Exception:
+        pass
+    # Also check the iframe element's src attribute on the page itself
+    try:
+        iframe_ele = page.ele('xpath://iframe[contains(@src,"recaptcha/api2/anchor")]', timeout=1)
+        if iframe_ele:
+            src = iframe_ele.attr('src') or ''
+            if 'size=invisible' in src:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def try_invoke_grecaptcha_execute(page):
+    """For invisible reCAPTCHA, programmatically invoke grecaptcha.execute() to trigger challenge."""
+    try:
+        page.run_js("""
+            if (typeof grecaptcha !== 'undefined') {
+                try {
+                    // Try to execute the first widget (typical case)
+                    if (grecaptcha.execute) grecaptcha.execute();
+                    // Some sites use widget-list API
+                    if (grecaptcha.widgets && grecaptcha.widgets.length > 0) {
+                        try { grecaptcha.execute(grecaptcha.widgets[0]); } catch(e) {}
+                    }
+                } catch(e) {}
+            }
+        """)
+        return True
+    except Exception as e:
+        log(f"grecaptcha.execute() failed: {e}", "WARN")
+        return False
+
+
 def click_recaptcha_checkbox(page):
-    """Click reCAPTCHA checkbox with retry logic"""
+    """Click reCAPTCHA checkbox (visible mode only). For invisible mode, this is a no-op."""
+    if is_invisible_recaptcha(page):
+        log("Invisible reCAPTCHA detected — no checkbox to click, invoking execute() instead")
+        try_invoke_grecaptcha_execute(page)
+        time.sleep(2)
+        return
+
     anchor = find_recaptcha_frame(page, "anchor")
     if not anchor:
         for _ in range(60):
@@ -215,12 +263,12 @@ def click_recaptcha_checkbox(page):
     if not anchor:
         raise RuntimeError("reCAPTCHA anchor frame not found")
 
-    # Wait for the anchor frame's document to be fully loaded (cross-origin iframe content needs time)
+    # Wait for the anchor frame's document to be fully loaded
     log("Waiting for reCAPTCHA anchor frame content to load...")
     if not wait_for_frame_ready(anchor, timeout=20):
         log("Anchor frame did not reach readyState=complete within 20s", "WARN")
 
-    # Diagnostic: log what's inside the anchor frame (helps debug "checkbox not found")
+    # Diagnostic: log what's inside the anchor frame
     try:
         body_snippet = anchor.run_js(
             "return document.body ? document.body.innerHTML.substring(0, 300) : 'no body'"
@@ -250,27 +298,7 @@ def click_recaptcha_checkbox(page):
             continue
 
     if not checkbox:
-        # Fallback: click the iframe element directly (the iframe IS the checkbox area visually)
-        log("Checkbox not found inside frame, trying to click iframe element directly", "WARN")
-        try:
-            iframe_ele = page.ele('xpath://iframe[contains(@src,"recaptcha/api2/anchor")]', timeout=2)
-            if iframe_ele:
-                log("Found anchor iframe element, clicking on it directly")
-                page.actions.move_to(iframe_ele, duration=random.uniform(0.4, 1.0))
-                time.sleep(random.uniform(0.2, 0.5))
-                try:
-                    iframe_ele.click()
-                except Exception:
-                    iframe_ele.click(by_js=True)
-                time.sleep(3)
-                if is_blocked(page):
-                    raise Exception("IP blocked by Google reCAPTCHA")
-                return
-        except Exception as e:
-            if "blocked" in str(e).lower():
-                raise
-            log(f"Iframe click fallback failed: {e}", "WARN")
-        raise RuntimeError("reCAPTCHA checkbox not found")
+        raise RuntimeError("reCAPTCHA checkbox not found (visible mode but no checkbox element)")
 
     page.actions.move_to(checkbox, duration=random.uniform(0.4, 1.0))
     time.sleep(random.uniform(0.2, 0.5))
@@ -452,6 +480,7 @@ def recognize_audio(mp3_path):
 
 
 def solve_recaptcha(page):
+    """Solve reCAPTCHA — supports both visible (checkbox) and invisible modes."""
     start = time.time()
     while time.time() - start < 15:
         if find_recaptcha_frame(page, "anchor"):
@@ -459,6 +488,44 @@ def solve_recaptcha(page):
         time.sleep(1)
     else:
         raise RuntimeError("reCAPTCHA load timeout")
+
+    # Detect mode early
+    invisible = is_invisible_recaptcha(page)
+    log(f"reCAPTCHA mode: {'INVISIBLE' if invisible else 'VISIBLE'}")
+
+    # For invisible mode, the challenge bframe appears after the form submit triggers grecaptcha.execute().
+    # Give Google some time to render the challenge before we start probing.
+    if invisible:
+        log("Waiting up to 15s for invisible reCAPTCHA challenge bframe to appear...")
+        bframe_start = time.time()
+        while time.time() - bframe_start < 15:
+            if is_recaptcha_solved(page):
+                log("reCAPTCHA solved silently (no challenge)")
+                return True
+            if is_blocked(page):
+                raise Exception("IP blocked by Google reCAPTCHA")
+            # If audio mode is already active, the challenge is ready
+            if is_audio_mode(page):
+                log("Audio challenge already visible")
+                break
+            # If bframe exists and shows any visible content, that's also good enough
+            bframe = find_recaptcha_frame(page, "bframe")
+            if bframe:
+                try:
+                    has_content = bframe.run_js("""
+                        const el = document.querySelector('.rc-audiochallenge, .rc-imageselect-instructions, #audio-response');
+                        return !!(el && el.offsetParent !== null);
+                    """)
+                    if has_content:
+                        log("bframe challenge visible")
+                        break
+                except Exception:
+                    pass
+            # Try invoking execute() periodically (in case the form's submit handler didn't fire)
+            try_invoke_grecaptcha_execute(page)
+            time.sleep(2)
+        else:
+            log("bframe did not appear within 15s; proceeding to retry loop", "WARN")
 
     dl_fails = 0
     for i in range(MAX_CAPTCHA_ATTEMPTS):
@@ -468,8 +535,13 @@ def solve_recaptcha(page):
             raise Exception("IP blocked by Google reCAPTCHA")
 
         if i == 0:
-            click_recaptcha_checkbox(page)
-            time.sleep(2)
+            if invisible:
+                # Invisible: re-trigger execute() in case the challenge hasn't fired yet
+                try_invoke_grecaptcha_execute(page)
+                time.sleep(2)
+            else:
+                click_recaptcha_checkbox(page)
+                time.sleep(2)
             if is_recaptcha_solved(page):
                 return True
 
@@ -477,8 +549,13 @@ def solve_recaptcha(page):
             if not switch_to_audio(page):
                 time.sleep(3)
                 if not switch_to_audio(page):
-                    click_recaptcha_checkbox(page)
-                    time.sleep(3)
+                    if invisible:
+                        # Invisible: try execute again, then wait longer for challenge
+                        try_invoke_grecaptcha_execute(page)
+                        time.sleep(3)
+                    else:
+                        click_recaptcha_checkbox(page)
+                        time.sleep(3)
                     continue
             time.sleep(random.uniform(2, 4))
 
