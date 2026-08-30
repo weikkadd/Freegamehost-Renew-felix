@@ -488,17 +488,22 @@ def build_singbox_config(proxy: dict, listen_port: int = 10808) -> dict:
     }
     
     # Routing: send all traffic through proxy
-    routing = {
-        "rules": [
-            {"outbound": "proxy-out"},
-        ]
+    # In sing-box 1.11+ the routing config field was renamed to "route".
+    # We use "route" (new name). The "routing" name is deprecated/removed.
+    # If a route is needed (default route to proxy), use the new "default" field.
+    # Actually for simplest "send everything to proxy-out" routing, we can omit
+    # the route field entirely — sing-box's default behavior is to send to the
+    # first outbound, which is our "proxy-out".
+    # But to be explicit, use the new "route" key with "final" pointing to proxy.
+    route = {
+        "final": "proxy-out",
     }
     
     return {
         "log": {"level": "warn", "timestamp": True},
         "inbounds": inbounds,
         "outbounds": [outbound, direct_outbound],
-        "routing": routing,
+        "route": route,
     }
 
 
