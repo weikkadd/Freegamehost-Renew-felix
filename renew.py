@@ -699,19 +699,42 @@ def fill_and_verify(page, text):
         pass
     
     # CRITICAL: Wait for Google to process the verify response
-    # After clicking Verify, all bframe buttons become disabled for 1-3s
-    # while Google checks our answer server-side. We must wait for:
-    # 1. reCAPTCHA solved → return immediately (best case)
-    # 2. Verify button re-enabled → Google rejected our answer, can proceed
-    # 3. Verify button STAYS disabled for >5s → Google has BLOCKED us → raise BlockedError
+    # After clicking Verify, all bframe buttons become disabled while Google
+    # checks our answer server-side (答案错误时正常处理也可能超过 5s)。
+    # 判定"被 Google 封禁"必须依据明确的 block 错误消息,
+    # 不能只靠"按钮 disabled 超过几秒"(旧逻辑 5s 就判 block, 会误报,
+    # 尤其是在只有一个代理节点时, 误报触发轮换也换不到新 IP)。
     log("fill_and_verify: waiting for Google to process verify response...")
     start = time.time()
-    while time.time() - start < 5:
+    while time.time() - start < 20:
         # Best case: solved
         if is_recaptcha_solved(page):
             log(f"fill_and_verify: ✓ reCAPTCHA solved after {time.time()-start:.1f}s")
             return True
-        # Check verify button state
+        # 优先检测 Google 的明确反馈消息(比按钮状态更可靠)
+        try:
+            msg = bframe.run_js("""
+                const texts = [];
+                document.querySelectorAll('.rc-audiochallenge-error-message, #rc-audiochallenge-error-message')
+                    .forEach(el => { if (el.textContent.trim()) texts.push(el.textContent.trim()); });
+                const live = document.querySelector('[aria-live]');
+                if (live && live.textContent.trim()) texts.push(live.textContent.trim());
+                return texts.join(' | ');
+            """)
+            if msg:
+                msg_lower = msg.lower()
+                log(f"fill_and_verify: Google 反馈: {msg[:120]}")
+                if "your computer or network" in msg_lower or "sending automated queries" in msg_lower:
+                    # 明确的封禁消息才触发 IP 轮换
+                    raise BlockedError(f"Google block message: {msg[:100]}")
+                # 其他反馈(如 Try again) = 答案错误, 让调用方 reload 重试
+                time.sleep(0.5)
+                return False
+        except BlockedError:
+            raise
+        except Exception:
+            pass
+        # 补充: 按钮重新启用 = 答案被拒绝
         try:
             state = bframe.run_js("""
                 const btn = document.querySelector('#recaptcha-verify-button');
@@ -720,22 +743,19 @@ def fill_and_verify(page, text):
                 return 'enabled';
             """)
             if state == 'enabled':
-                # Button re-enabled = Google processed our answer (and we were wrong)
                 elapsed = time.time() - start
                 log(f"fill_and_verify: verify button re-enabled after {elapsed:.1f}s (answer rejected)")
-                # Give DOM a moment to settle
                 time.sleep(0.5)
                 return False  # answer was wrong, caller should reload
-            # else still disabled — keep waiting
         except Exception:
             pass
-        time.sleep(0.25)
-    
-    # Timeout: verify button stayed disabled for >5s
-    # Google has BLOCKED us — raise BlockedError to trigger WARP IP rotation
+        time.sleep(0.5)
+
+    # 20s 超时且无明确 block 消息 → 保守按"答案未通过"处理, 让调用方 reload 重试。
+    # 不轻易判定 blocked(单节点下轮换无效, 且误报会白跑整个重试循环)
     elapsed = time.time() - start
-    log(f"fill_and_verify: verify button stayed disabled for {elapsed:.1f}s — Google has BLOCKED us", "ERROR")
-    raise BlockedError(f"Verify button stuck disabled for {elapsed:.1f}s")
+    log(f"fill_and_verify: verify button still disabled after {elapsed:.1f}s without block message, treating as rejected", "WARN")
+    return False
 
 
 def download_audio(url):
@@ -1247,6 +1267,11 @@ def main():
                             raise
 
             if ip_blocked:
+                # 只有一个节点时轮换换不到新 IP(还是同一个出口), 直接同 IP 重试更实际
+                if _proxy_manager and len(_proxy_manager.proxies) <= 1:
+                    log(f"Only 1 proxy node — rotation won't change IP, retrying same IP (attempt {ip_attempt+1}/{MAX_IP_ROTATIONS})", "WARN")
+                    time.sleep(5)
+                    continue
                 # Rotate proxy and retry the whole login + reCAPTCHA flow
                 if ip_attempt + 1 < MAX_IP_ROTATIONS:
                     log(f"Rotating proxy (attempt {ip_attempt+1}/{MAX_IP_ROTATIONS})...")
