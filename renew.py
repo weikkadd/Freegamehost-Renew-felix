@@ -1,10 +1,10 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 FreeGameHost.xyz 自动续期脚本
 使用 SeleniumBase 模拟浏览器登录并点击 Renew 按钮。
 环境变量:
   FGH_ACCOUNT  — 必填，格式: email,password
-  GOST_PROXY   — 可选，格式: socks5://user:pass@host:port
+  GOST_PROXY   — 可选，格式: socks5://user:pass@host:port 或 ip:port#label
   TG_BOT       — 可选，格式: chat_id,bot_token
 """
 
@@ -48,6 +48,15 @@ def parse_env(name, sep=","):
     return parts if len(parts) > 1 else parts[0]
 
 
+def clean_proxy(proxy_str):
+    """清理代理字符串，去除 #label 后缀"""
+    if not proxy_str:
+        return None
+    # 去除形如 #AU-Microsoft_Azure 的后缀
+    clean = proxy_str.split('#')[0].strip()
+    return clean if clean else None
+
+
 def main():
     # ── 解析账号 ──
     account = parse_env("FGH_ACCOUNT")
@@ -65,19 +74,20 @@ def main():
         tg_chat_id, tg_bot_token = tg[0], tg[1]
 
     # ── 代理设置 ──
-    proxy = os.environ.get("GOST_PROXY", "").strip()
-    proxy_arg = None
-    if proxy:
-        proxy_arg = proxy
-        log(f"使用代理: {proxy.split('@')[-1] if '@' in proxy else proxy}")
+    raw_proxy = os.environ.get("GOST_PROXY", "").strip()
+    proxy_arg = clean_proxy(raw_proxy)
+    if proxy_arg:
+        log(f"使用代理: {proxy_arg}")
 
     # ── 启动浏览器 ──
-    with SB(
+    sb_kwargs = dict(
         browser="chrome",
         headless=True,
-        proxy=proxy_arg,
+    )
+    if proxy_arg:
+        sb_kwargs["proxy"] = proxy_arg
 
-    ) as sb:
+    with SB(**sb_kwargs) as sb:
 
         success = False
         error_msg = ""
