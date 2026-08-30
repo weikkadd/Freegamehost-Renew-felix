@@ -395,7 +395,12 @@ def get_audio_url(page):
 
 def reload_challenge(page):
     """Reload audio challenge. Returns True if audio URL changed after reload.
-    Uses multiple click strategies because the reload button can be stubborn."""
+    
+    Each click strategy is verified by checking if the audio URL changed immediately after.
+    If a strategy didn't actually work (URL stayed same), we try the next strategy.
+    This avoids the failure mode where DrissionPage's native .click() returns success
+    but the click was actually intercepted/no-op in the cross-origin iframe.
+    """
     bframe = find_recaptcha_frame(page, "bframe")
     if not bframe:
         log("reload_challenge: no bframe", "WARN")
@@ -403,22 +408,41 @@ def reload_challenge(page):
 
     old_url = get_audio_url(page)
     log(f"reload_challenge: old audio URL = {(old_url or 'None')[:80]}")
+    
+    # Diagnostic: dump bframe HTML structure to find the actual reload button
+    try:
+        buttons_html = bframe.run_js("""
+            const btns = document.querySelectorAll('button');
+            return Array.from(btns).map(b => ({
+                id: b.id,
+                cls: b.className,
+                title: b.title || '',
+                ariaLabel: b.getAttribute('aria-label') || '',
+                text: b.textContent.trim().substring(0, 30),
+                disabled: b.disabled,
+                rect: JSON.stringify({
+                    x: Math.round(b.getBoundingClientRect().x),
+                    y: Math.round(b.getBoundingClientRect().y),
+                    w: Math.round(b.getBoundingClientRect().width),
+                    h: Math.round(b.getBoundingClientRect().height),
+                    visible: b.offsetParent !== null
+                })
+            }));
+        """)
+        if buttons_html:
+            log(f"reload_challenge: bframe buttons = {buttons_html}")
+    except Exception as e:
+        log(f"reload_challenge: failed to dump buttons: {e}", "WARN")
 
-    click_strategies = [
-        # Strategy 1: DrissionPage native click with visibility check
-        ('dp-native', lambda: _try_dp_click(bframe, '#recaptcha-reload-button')),
-        # Strategy 2: JS click on the element by ID
-        ('js-id', lambda: bframe.run_js(
+    def click_strategies():
+        """Generator yielding (name, fn) pairs of click strategies."""
+        # Strategy 1: JS click on the element by ID — try this FIRST, more reliable in cross-origin iframe
+        yield ('js-id', lambda: bframe.run_js(
             "const btn = document.querySelector('#recaptcha-reload-button'); "
             "if (btn) { btn.click(); return true; } return false;"
-        )),
-        # Strategy 3: JS click on the element by button role + reload icon class
-        ('js-role', lambda: bframe.run_js(
-            'const btn = document.querySelector(\'button#recaptcha-reload-button, button[aria-label*="eload"], button[title*="eload"]\'); '
-            'if (btn) { btn.click(); return true; } return false;'
-        )),
-        # Strategy 4: dispatch synthetic MouseEvent (sometimes .click() is intercepted)
-        ('js-mouseevent', lambda: bframe.run_js("""
+        ))
+        # Strategy 2: synthetic MouseEvent with element center coordinates
+        yield ('js-mouseevent', lambda: bframe.run_js("""
             const btn = document.querySelector('#recaptcha-reload-button');
             if (!btn) return false;
             const rect = btn.getBoundingClientRect();
@@ -429,9 +453,9 @@ def reload_challenge(page):
             });
             btn.dispatchEvent(evt);
             return true;
-        """)),
-        # Strategy 5: simulate real pointer events (pointerdown + pointerup + click)
-        ('js-pointer', lambda: bframe.run_js("""
+        """))
+        # Strategy 3: full pointer event sequence (pointerdown + mousedown + pointerup + mouseup + click)
+        yield ('js-pointer', lambda: bframe.run_js("""
             const btn = document.querySelector('#recaptcha-reload-button');
             if (!btn) return false;
             const rect = btn.getBoundingClientRect();
@@ -447,43 +471,86 @@ def reload_challenge(page):
             btn.dispatchEvent(new MouseEvent('mouseup', opts));
             btn.dispatchEvent(new MouseEvent('click', opts));
             return true;
-        """)),
-    ]
+        """))
+        # Strategy 4: DrissionPage native click (LAST resort, since DP click in cross-origin iframe is often no-op)
+        yield ('dp-native', lambda: _try_dp_click(bframe, '#recaptcha-reload-button'))
+        # Strategy 5: try by aria-label/title (in case ID is wrong)
+        yield ('js-aria', lambda: bframe.run_js(
+            'const btn = document.querySelector(\'button[aria-label*="eload"], button[title*="eload"]\'); '
+            'if (btn) { btn.click(); return true; } return false;'
+        ))
+        # Strategy 6: try clicking on the reload button via parent (some recaptchas wrap it)
+        yield ('js-parent', lambda: bframe.run_js("""
+            const btn = document.querySelector('#recaptcha-reload-button');
+            if (!btn) return false;
+            // Find clickable parent
+            let target = btn;
+            for (let i = 0; i < 3; i++) {
+                target = target.parentElement;
+                if (!target) break;
+                if (target.onclick || target.getAttribute('role') === 'button') {
+                    target.click();
+                    return true;
+                }
+            }
+            // Last resort: directly call the recaptcha JS API
+            try {
+                if (typeof ___grecaptcha_cfg !== 'undefined') {
+                    // Force a new challenge by reloading
+                    const count = ___grecaptcha_cfg.count || 0;
+                    return false;
+                }
+            } catch (e) {}
+            return false;
+        """))
 
-    clicked_strategy = None
-    for name, fn in click_strategies:
+    # Try each strategy; verify by checking if URL changed within 1.5s after click
+    for name, fn in click_strategies():
         try:
             result = fn()
-            if result:
-                log(f"reload_challenge: clicked via strategy '{name}'")
-                clicked_strategy = name
-                break
+            if not result:
+                log(f"reload_challenge: strategy '{name}' returned False (button not found)", "WARN")
+                continue
+            log(f"reload_challenge: clicked via strategy '{name}', verifying...")
+            
+            # Verify by polling for URL change (max 2 seconds per strategy)
+            changed = False
+            for i in range(8):
+                time.sleep(0.25)
+                new_url = get_audio_url(page)
+                # URL changed = reload worked
+                # OR: URL became None = challenge mode changed (image mode), which also means reload "happened"
+                #     — but we want a NEW audio URL, so None is bad
+                if new_url and new_url != old_url:
+                    changed = True
+                    log(f"reload_challenge: ✓ strategy '{name}' worked, URL changed after {(i+1)*0.25:.2f}s")
+                    break
+                if not new_url and old_url:
+                    # URL disappeared — challenge probably switched to image mode
+                    log(f"reload_challenge: strategy '{name}' caused URL to disappear (challenge mode changed?)", "WARN")
+                    # Try to switch back to audio
+                    time.sleep(1)
+                    if switch_to_audio(page):
+                        time.sleep(2)
+                        newer_url = get_audio_url(page)
+                        if newer_url and newer_url != old_url:
+                            log(f"reload_challenge: ✓ strategy '{name}' + switch_to_audio worked")
+                            changed = True
+                            break
+                    break  # break out of inner poll loop
+            
+            if changed:
+                # Wait a bit more for the new audio to fully load
+                time.sleep(random.uniform(0.5, 1.0))
+                return True
+            else:
+                log(f"reload_challenge: ✗ strategy '{name}' did not change URL, trying next...", "WARN")
         except Exception as e:
             log(f"reload_challenge: strategy '{name}' error: {e}", "WARN")
             continue
 
-    if not clicked_strategy:
-        log("reload_challenge: all click strategies failed", "WARN")
-        return False
-
-    # Wait for the audio URL to change (max 10 seconds)
-    new_url = None
-    changed = False
-    for i in range(20):
-        time.sleep(0.5)
-        new_url = get_audio_url(page)
-        if new_url and new_url != old_url:
-            changed = True
-            log(f"reload_challenge: audio URL changed after {(i+1)*0.5:.1f}s")
-            break
-
-    if not changed:
-        log("reload_challenge: audio URL did not change after 10s (button click may have been intercepted)", "WARN")
-        return False
-
-    # Give Google a moment to fully load the new audio
-    time.sleep(random.uniform(0.5, 1.0))
-    return True
+    log("reload_challenge: ALL strategies failed to change audio URL", "WARN")
+    return False
 
 
 def _try_dp_click(bframe, selector):
