@@ -419,6 +419,39 @@ def reload_challenge(page):
     log(f"reload_challenge: old audio URL = {(old_url or 'None')[:80]}")
     func_start = time.time()
     
+    # CRITICAL: Wait for reload button to be enabled.
+    # After clicking Verify, Google disables ALL bframe buttons for 1-3s while it
+    # processes the answer server-side. Clicking a disabled button is silently ignored.
+    # We must wait for the button to become enabled before clicking.
+    log("reload_challenge: waiting for reload button to be enabled...")
+    btn_ready = False
+    while time.time() - func_start < 8:  # max 8s wait
+        try:
+            state = bframe.run_js("""
+                const btn = document.querySelector('#recaptcha-reload-button');
+                if (!btn) return 'gone';
+                if (btn.disabled) return 'disabled';
+                // Also check the disabled CSS class (Google uses both)
+                if (btn.className.includes('rc-button-disabled')) return 'disabled-css';
+                return 'enabled';
+            """)
+            if state == 'enabled':
+                btn_ready = True
+                log(f"reload_challenge: reload button enabled after {time.time()-func_start:.1f}s")
+                break
+            elif state in ('disabled', 'disabled-css'):
+                # Still disabled, keep waiting
+                pass
+            elif state == 'gone':
+                log("reload_challenge: reload button disappeared!", "WARN")
+                break
+        except Exception:
+            pass
+        time.sleep(0.3)
+    
+    if not btn_ready:
+        log(f"reload_challenge: reload button still disabled after 8s, trying anyway", "WARN")
+    
     # Diagnostic: dump bframe HTML structure to find the actual reload button
     try:
         buttons_html = bframe.run_js("""
@@ -596,6 +629,15 @@ def _try_dp_click(bframe, selector):
 
 
 def fill_and_verify(page, text):
+    """Fill audio response and click Verify, then wait for Google to process the response.
+    
+    After clicking Verify, Google disables ALL buttons in the bframe for 1-3 seconds
+    while it processes the response server-side. If we try to reload immediately after,
+    the reload button click is silently ignored (button is disabled).
+    
+    This function waits up to 10s for the verify button to become enabled again
+    (or for the challenge to be solved, or for the audio URL to be cleared).
+    """
     bframe = find_recaptcha_frame(page, "bframe")
     if not bframe:
         return False
@@ -606,19 +648,60 @@ def fill_and_verify(page, text):
         input_box.click()
         input_box.clear()
         input_box.input(text)
-    except:
+    except Exception:
         return False
     time.sleep(random.uniform(0.5, 1.5))
+    
+    # Click Verify (use JS click as fallback if native click fails)
     try:
         verify_btn = bframe.ele('#recaptcha-verify-button', timeout=2)
         if verify_btn:
             try:
                 verify_btn.click()
-            except:
-                verify_btn.click(by_js=True)
-    except:
+            except Exception:
+                try:
+                    verify_btn.click(by_js=True)
+                except Exception:
+                    bframe.run_js("document.querySelector('#recaptcha-verify-button')?.click();")
+    except Exception:
         pass
-    return True
+    
+    # CRITICAL: Wait for Google to process the verify response
+    # After clicking Verify, all bframe buttons become disabled for 1-3s
+    # while Google checks our answer server-side. We must wait for:
+    # 1. reCAPTCHA solved → return immediately (best case)
+    # 2. Verify button re-enabled → Google rejected our answer, can proceed
+    # 3. Verify button text changes to 'Skip' → indicates too many wrong attempts
+    log("fill_and_verify: waiting for Google to process verify response...")
+    start = time.time()
+    while time.time() - start < 10:
+        # Best case: solved
+        if is_recaptcha_solved(page):
+            log(f"fill_and_verify: ✓ reCAPTCHA solved after {time.time()-start:.1f}s")
+            return True
+        # Check verify button state
+        try:
+            state = bframe.run_js("""
+                const btn = document.querySelector('#recaptcha-verify-button');
+                if (!btn) return 'gone';
+                if (btn.disabled) return 'disabled';
+                return 'enabled';
+            """)
+            if state == 'enabled':
+                # Button re-enabled = Google processed our answer (and we were wrong)
+                elapsed = time.time() - start
+                log(f"fill_and_verify: verify button re-enabled after {elapsed:.1f}s (answer rejected)")
+                # Give DOM a moment to settle
+                time.sleep(0.5)
+                return False  # answer was wrong, caller should reload
+            # else still disabled — keep waiting
+        except Exception:
+            pass
+        time.sleep(0.25)
+    
+    # Timeout: we don't know what happened, just return and let caller handle
+    log("fill_and_verify: timed out waiting for verify button state (10s)", "WARN")
+    return False
 
 
 def download_audio(url):
@@ -898,10 +981,13 @@ def solve_recaptcha(page):
             same_text_streak = 0
         last_text = text
 
-        fill_and_verify(page, text)
-        time.sleep(5)
-        if is_recaptcha_solved(page):
+        # fill_and_verify now waits for Google to process the answer (1-3s typically)
+        # and returns True if solved, False if answer was rejected
+        verified = fill_and_verify(page, text)
+        if verified:
             return True
+        # Brief delay before reload (randomize to avoid pattern detection)
+        time.sleep(random.uniform(1.5, 2.5))
 
         # Reload and verify it actually changed the audio URL — try up to 3 times
         reload_ok = False
