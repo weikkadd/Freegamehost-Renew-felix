@@ -40,8 +40,10 @@ def send_tg(token, chat_id, text):
         r = requests.post(url, data=data, timeout=30)
         r.raise_for_status()
         log("Telegram notification sent")
+        return True
     except Exception as e:
         log(f"Telegram notification failed: {e}", "ERROR")
+        return False
 
 
 def mask_url(url):
@@ -65,7 +67,6 @@ def fill_login_form(page, email, password):
     """Fill login form using JS injection (SPA compatible)"""
     log("Filling login info...")
     
-    # Use JS to find and fill inputs
     result = page.run_js(f"""
         const inputs = document.querySelectorAll('input');
         let usernameFilled = false;
@@ -73,7 +74,6 @@ def fill_login_form(page, email, password):
         
         inputs.forEach(inp => {{
             const type = inp.type || '';
-            const name = inp.name || '';
             const placeholder = (inp.placeholder || '').toLowerCase();
             
             if (!usernameFilled && (type === 'email' || type === 'text' || placeholder.includes('email') || placeholder.includes('user'))) {{
@@ -103,14 +103,12 @@ def debug_page(page):
     log(f"URL: {page.url}")
     log(f"Title: {page.title}")
     
-    # Get page HTML length
     try:
         html_content = page.html
         log(f"HTML length: {len(html_content)}")
     except:
         pass
     
-    # Find all inputs
     try:
         inputs = page.eles('input')
         log(f"Found {len(inputs)} inputs:")
@@ -122,7 +120,6 @@ def debug_page(page):
     except Exception as e:
         log(f"Failed to get inputs: {e}", "WARN")
     
-    # Find all buttons
     try:
         buttons = page.eles('button')
         log(f"Found {len(buttons)} buttons:")
@@ -131,7 +128,6 @@ def debug_page(page):
     except Exception as e:
         log(f"Failed to get buttons: {e}", "WARN")
     
-    # Check for reCAPTCHA frames
     try:
         frames = page.get_frames()
         log(f"Found {len(frames)} frames:")
@@ -194,6 +190,7 @@ def is_blocked(page):
 
 
 def click_recaptcha_checkbox(page):
+    """Click reCAPTCHA checkbox with retry logic"""
     anchor = find_recaptcha_frame(page, "anchor")
     if not anchor:
         for _ in range(60):
@@ -203,9 +200,28 @@ def click_recaptcha_checkbox(page):
             time.sleep(1)
     if not anchor:
         raise RuntimeError("reCAPTCHA anchor frame not found")
-    checkbox = anchor.ele('#recaptcha-anchor', timeout=3)
+    
+    # Try multiple selectors for checkbox
+    checkbox_selectors = [
+        '#recaptcha-anchor',
+        '[role="checkbox"]',
+        '.recaptcha-checkbox-border',
+        '.rc-anchor-checkbox',
+    ]
+    
+    checkbox = None
+    for sel in checkbox_selectors:
+        try:
+            checkbox = anchor.ele(sel, timeout=2)
+            if checkbox:
+                log(f"Found checkbox using selector: {sel}")
+                break
+        except:
+            continue
+    
     if not checkbox:
         raise RuntimeError("reCAPTCHA checkbox not found")
+    
     page.actions.move_to(checkbox, duration=random.uniform(0.4, 1.0))
     time.sleep(random.uniform(0.2, 0.5))
     try:
@@ -466,7 +482,6 @@ def capture_screenshot(page, filename):
 
 
 def main():
-    # Parse config
     account = os.environ.get("FGH_ACCOUNT", "").strip()
     if not account or "," not in account:
         log("ERROR: FGH_ACCOUNT not set or invalid format", "ERROR")
@@ -481,7 +496,6 @@ def main():
     tg_token = os.environ.get("TG_BOT_TOKEN", "").strip()
     tg_chat_id = os.environ.get("TG_CHAT_ID", "").strip()
 
-    # Start virtual display
     vdisplay = Xvfb(width=1920, height=1080, colordepth=24)
     vdisplay.start()
 
@@ -489,7 +503,6 @@ def main():
     error_msg = ""
 
     try:
-        # Launch browser
         co = ChromiumOptions()
         co.set_browser_path('/usr/bin/google-chrome')
         co.set_argument('--no-sandbox')
@@ -506,7 +519,6 @@ def main():
 
         page = ChromiumPage(co)
 
-        # Anti-fingerprint
         page.run_js("""
             const getParameter = WebGLRenderingContext.prototype.getParameter;
             WebGLRenderingContext.prototype.getParameter = function(parameter) {
@@ -519,19 +531,14 @@ def main():
             Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
         """)
 
-        # Access login page
         log("Opening login page...")
         page.get(f"{PANEL_URL}/auth/login")
-        time.sleep(15)  # Wait for SPA to fully render
+        time.sleep(15)
         page.get_screenshot(f"{SCREENSHOT_DIR}/01_login_page.png")
         
-        # Debug page content
         debug_page(page)
-        
-        # Fill credentials using JS injection (works with SPA)
         fill_login_form(page, email, password)
 
-        # Click login
         log("Clicking login button...")
         page.run_js('document.querySelector("button[type=submit]")?.click() || document.querySelector("button:contains(LOGIN)")?.click()')
 
@@ -541,14 +548,12 @@ def main():
         page.get_screenshot(f"{SCREENSHOT_DIR}/02_after_login.png")
 
         if "login" in current_url.lower():
-            # Check for reCAPTCHA
             if find_recaptcha_frame(page, "anchor"):
                 log("reCAPTCHA detected, starting solve...")
                 try:
                     solve_recaptcha(page)
                     log("reCAPTCHA solved")
                     time.sleep(3)
-                    # Re-click login
                     page.run_js('document.querySelector("button[type=submit]")?.click()')
                     time.sleep(10)
                     current_url = page.url
@@ -565,13 +570,11 @@ def main():
 
         log("Login successful!")
 
-        # Go to dashboard
         log("Opening dashboard...")
         page.get(f"{PANEL_URL}/")
         time.sleep(5)
         page.get_screenshot(f"{SCREENSHOT_DIR}/03_dashboard.png")
 
-        # Find renewal links
         server_links = page.eles('a[href*="/server/renew"]')
         if not server_links:
             server_links = page.eles('a[href*="/server/"]')
@@ -590,7 +593,6 @@ def main():
                     old_expire = get_expire_time(page)
                     log(f"Server {i+1} expires: {old_expire}")
 
-                    # Click Renew button
                     renew_btn = None
                     try:
                         renew_btn = page.ele('xpath://button[contains(text(), "Renew server")]', timeout=3)
@@ -620,7 +622,6 @@ def main():
 
                     time.sleep(5)
 
-                    # Check reCAPTCHA
                     if find_recaptcha_frame(page, "anchor"):
                         log(f"Server {i+1} reCAPTCHA detected")
                         try:
@@ -631,7 +632,6 @@ def main():
                             log(f"Server {i+1} reCAPTCHA failed: {e}", "ERROR")
                             continue
 
-                    # Confirm renew
                     confirm_btn = None
                     try:
                         confirm_btn = page.ele('xpath://button[normalize-space(text())="Renew"]', timeout=5)
