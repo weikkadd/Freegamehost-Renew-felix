@@ -1047,6 +1047,36 @@ def solve_recaptcha(page):
     raise RuntimeError("Max captcha attempts reached")
 
 
+def rotate_warp_ip():
+    """Rotate Cloudflare WARP exit IP by disconnecting and reconnecting.
+    
+    Returns True if rotation succeeded, False otherwise.
+    Used to escape Google reCAPTCHA's IP-based blocking.
+    """
+    log("Rotating WARP IP...")
+    try:
+        # Disconnect WARP
+        log("  disconnecting WARP...")
+        os.system("warp-cli disconnect 2>&1 | tail -3")
+        time.sleep(3)
+        # Reconnect WARP
+        log("  reconnecting WARP...")
+        os.system("warp-cli connect 2>&1 | tail -3")
+        time.sleep(5)
+        # Verify new IP
+        try:
+            r = requests.get("https://api.ipify.org", timeout=10)
+            new_ip = r.text.strip()
+            log(f"  new WARP exit IP: {new_ip}")
+            return True
+        except Exception as e:
+            log(f"  failed to verify new IP: {e}", "WARN")
+            return True  # assume it worked
+    except Exception as e:
+        log(f"WARP rotation failed: {e}", "ERROR")
+        return False
+
+
 def capture_screenshot(page, filename):
     try:
         os.makedirs(os.path.dirname(filename), exist_ok=True)
@@ -1107,42 +1137,71 @@ def main():
             Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
         """)
 
-        log("Opening login page...")
-        page.get(f"{PANEL_URL}/auth/login")
-        time.sleep(15)
-        page.get_screenshot(f"{SCREENSHOT_DIR}/01_login_page.png")
-        
-        debug_page(page)
-        fill_login_form(page, email, password)
+        # Retry loop for login + reCAPTCHA — on IP block, rotate WARP and retry
+        MAX_IP_ROTATIONS = 3
+        for ip_attempt in range(MAX_IP_ROTATIONS):
+            if ip_attempt > 0:
+                log(f"=== Retry attempt {ip_attempt+1}/{MAX_IP_ROTATIONS} after WARP IP rotation ===")
+            
+            log("Opening login page...")
+            page.get(f"{PANEL_URL}/auth/login")
+            time.sleep(15)
+            page.get_screenshot(f"{SCREENSHOT_DIR}/01_login_page.png")
+            
+            debug_page(page)
+            fill_login_form(page, email, password)
 
-        log("Clicking login button...")
-        page.run_js('document.querySelector("button[type=submit]")?.click()')
+            log("Clicking login button...")
+            page.run_js('document.querySelector("button[type=submit]")?.click()')
 
-        time.sleep(10)
-        current_url = page.url
-        log(f"After login URL: {current_url}")
-        page.get_screenshot(f"{SCREENSHOT_DIR}/02_after_login.png")
+            time.sleep(10)
+            current_url = page.url
+            log(f"After login URL: {current_url}")
+            page.get_screenshot(f"{SCREENSHOT_DIR}/02_after_login.png")
 
-        if "login" in current_url.lower():
-            if find_recaptcha_frame(page, "anchor"):
-                log("reCAPTCHA detected, starting solve...")
-                try:
-                    solve_recaptcha(page)
-                    log("reCAPTCHA solved")
-                    time.sleep(3)
-                    page.run_js('document.querySelector("button[type=submit]")?.click()')
-                    time.sleep(10)
-                    current_url = page.url
-                except Exception as e:
-                    error_msg = f"reCAPTCHA solve failed: {e}"
+            ip_blocked = False
+            if "login" in current_url.lower():
+                if find_recaptcha_frame(page, "anchor"):
+                    log("reCAPTCHA detected, starting solve...")
+                    try:
+                        solve_recaptcha(page)
+                        log("reCAPTCHA solved")
+                        time.sleep(3)
+                        page.run_js('document.querySelector("button[type=submit]")?.click()')
+                        time.sleep(10)
+                        current_url = page.url
+                    except Exception as e:
+                        err_str = str(e)
+                        # Detect IP-blocked exception → rotate WARP and retry
+                        if "IP blocked by Google reCAPTCHA" in err_str:
+                            log(f"reCAPTCHA IP blocked, will rotate WARP and retry", "WARN")
+                            page.get_screenshot(f"{SCREENSHOT_DIR}/error_captcha_blocked_{ip_attempt+1}.png")
+                            ip_blocked = True
+                        else:
+                            error_msg = f"reCAPTCHA solve failed: {e}"
+                            log(f"ERROR: {error_msg}", "ERROR")
+                            page.get_screenshot(f"{SCREENSHOT_DIR}/error_captcha.png")
+                            raise
+
+            if ip_blocked:
+                # Rotate WARP IP and retry the whole login + reCAPTCHA flow
+                if ip_attempt + 1 < MAX_IP_ROTATIONS:
+                    log(f"Rotating WARP IP (attempt {ip_attempt+1}/{MAX_IP_ROTATIONS})...")
+                    rotate_warp_ip()
+                    # Re-open login page on new IP, fresh reCAPTCHA challenge
+                    continue
+                else:
+                    error_msg = "Max IP rotations reached, Google reCAPTCHA still blocking"
                     log(f"ERROR: {error_msg}", "ERROR")
-                    page.get_screenshot(f"{SCREENSHOT_DIR}/error_captcha.png")
-                    raise
+                    raise Exception(error_msg)
 
             if "login" in page.url.lower():
                 error_msg = "Login failed: check username/password"
                 page.get_screenshot(f"{SCREENSHOT_DIR}/error_login_failed.png")
                 raise Exception(error_msg)
+
+            # Login successful — break out of retry loop
+            break
 
         log("Login successful!")
 
