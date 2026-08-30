@@ -1,12 +1,8 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 FreeGameHost.xyz Auto Renew Script
 Uses DrissionPage + reCAPTCHA audio recognition
-Environment variables:
-  FGH_ACCOUNT  - required, format: email,password
-  TG_BOT_TOKEN - Telegram Bot Token
-  TG_CHAT_ID   - Telegram Chat ID
 """
 
 import os
@@ -24,12 +20,80 @@ try:
     import speech_recognition as sr
     from pydub import AudioSegment
 except ImportError:
-    print("[WARN] speech_recognition/pydub not installed, audio captcha unavailable")
+    print("[WARN] speech_recognition/pydub not installed")
     sr = None
 
 PANEL_URL = "https://panel.freegamehost.xyz"
 MAX_CAPTCHA_ATTEMPTS = 3
 SCREENSHOT_DIR = "output/screenshots"
+
+
+def log(msg, level="INFO"):
+    prefix = {"INFO": "[FGH-Renew]", "WARN": "[WARN]", "ERROR": "[ERROR]"}.get(level, "[FGH-Renew]")
+    print(f"{prefix} {msg}", flush=True)
+
+
+def send_tg(token, chat_id, text):
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+        r = requests.post(url, data=data, timeout=30)
+        r.raise_for_status()
+        log("Telegram notification sent")
+    except Exception as e:
+        log(f"Telegram notification failed: {e}", "ERROR")
+
+
+def mask_url(url):
+    import re
+    return re.sub(r'(\?i=)([^&]{1})([^&]*)', r'\1\2***', url)
+
+
+def get_expire_time(page):
+    selectors = ['#expireDate', 'text:Expires in:', 'text:Deletes on:']
+    for sel in selectors:
+        try:
+            ele = page.ele(sel, timeout=2)
+            if ele:
+                return ele.text.strip()
+        except:
+            continue
+    return "Unknown"
+
+
+def fill_login_form(page, email, password):
+    """Fill login form using JS injection (SPA compatible)"""
+    log("Filling login info...")
+    
+    # Use JS to find and fill inputs
+    result = page.run_js(f"""
+        const inputs = document.querySelectorAll('input');
+        let usernameFilled = false;
+        let passwordFilled = false;
+        
+        inputs.forEach(inp => {{
+            const type = inp.type || '';
+            const name = inp.name || '';
+            const placeholder = (inp.placeholder || '').toLowerCase();
+            
+            if (!usernameFilled && (type === 'email' || type === 'text' || placeholder.includes('email') || placeholder.includes('user'))) {{
+                inp.value = '{email}';
+                inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                usernameFilled = true;
+            }} else if (!passwordFilled && type === 'password') {{
+                inp.value = '{password}';
+                inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                inp.dispatchEvent(new Event('change', {{bubbles: true}}));
+                passwordFilled = true;
+            }}
+        }});
+        
+        return {{username: usernameFilled, password: passwordFilled}};
+    """)
+    
+    log(f"JS fill result: {result}")
+    return result.get('username', False) and result.get('password', False)
 
 
 def debug_page(page):
@@ -39,11 +103,10 @@ def debug_page(page):
     log(f"URL: {page.url}")
     log(f"Title: {page.title}")
     
-    # Get page text
+    # Get page HTML length
     try:
-        text = page.html
-        log(f"Page text length: {len(text)}")
-        log(f"Page text preview: {text[:300]}")
+        html_content = page.html
+        log(f"HTML length: {len(html_content)}")
     except:
         pass
     
@@ -78,55 +141,6 @@ def debug_page(page):
         log(f"Failed to get frames: {e}", "WARN")
     
     log("=" * 50)
-
-
-def log(msg, level="INFO"):
-    prefix = {"INFO": "[FGH-Renew]", "WARN": "[WARN]", "ERROR": "[ERROR]"}.get(level, "[FGH-Renew]")
-    print(f"{prefix} {msg}", flush=True)
-
-
-def send_tg(token, chat_id, text):
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
-        r = requests.post(url, data=data, timeout=30)
-        r.raise_for_status()
-        log("Telegram notification sent")
-    except Exception as e:
-        log(f"Telegram notification failed: {e}", "ERROR")
-
-
-def mask_url(url):
-    import re
-    return re.sub(r'(\?i=)([^&]{1})([^&]*)', r'\1\2***', url)
-
-
-def get_server_name(page):
-    try:
-        ele = page.ele('#serverName', timeout=2)
-        if ele:
-            return ele.text.strip()
-    except:
-        pass
-    try:
-        ele = page.ele('text:/鏈嶅姟鍣▅server/i', timeout=2)
-        if ele:
-            return ele.text.strip()
-    except:
-        pass
-    return "Unknown"
-
-
-def get_expire_time(page):
-    selectors = ['#expireDate', 'text:Expires in:', 'text:Deletes on:']
-    for sel in selectors:
-        try:
-            ele = page.ele(sel, timeout=2)
-            if ele:
-                return ele.text.strip()
-        except:
-            continue
-    return "Unknown"
 
 
 # reCAPTCHA functions
@@ -455,7 +469,7 @@ def main():
     # Parse config
     account = os.environ.get("FGH_ACCOUNT", "").strip()
     if not account or "," not in account:
-        log("ERROR: FGH_ACCOUNT not set or invalid format (should be email,password)", "ERROR")
+        log("ERROR: FGH_ACCOUNT not set or invalid format", "ERROR")
         sys.exit(1)
 
     email, password = account.split(",", 1)
@@ -511,65 +525,15 @@ def main():
         time.sleep(15)  # Wait for SPA to fully render
         page.get_screenshot(f"{SCREENSHOT_DIR}/01_login_page.png")
         
-        # Check if page loaded correctly
-        current_url = page.url
-        page_text = page.html[:2000] if page.html else ""
-        log(f"Current URL: {current_url}")
-        
         # Debug page content
         debug_page(page)
         
-        # If stuck on Cloudflare challenge, wait more
-        if "cloudflare" in current_url.lower() or "attention required" in page_text.lower():
-            log("Cloudflare challenge detected, waiting...", "WARN")
-            time.sleep(10)
-            page.get(f"{PANEL_URL}/auth/login")
-            time.sleep(15)
-
-        # Fill credentials with multiple selector attempts
-        log("Filling login info...")
-        
-        # Try different selectors for username
-        username_selectors = ['input[name="username"]', 'input[type="email"]', 'input[placeholder*="email" i]', '#username']
-        username_filled = False
-        for sel in username_selectors:
-            try:
-                ele = page.ele(sel, timeout=2)
-                if ele:
-                    ele.input(email)
-                    log(f"Username filled using selector: {sel}")
-                    username_filled = True
-                    break
-            except:
-                continue
-        if not username_filled:
-            log("Failed to find username input", "WARN")
-        
-        # Try different selectors for password
-        password_selectors = ['input[name="password"]', 'input[type="password"]', 'input[placeholder*="password" i]', '#password']
-        password_filled = False
-        for sel in password_selectors:
-            try:
-                ele = page.ele(sel, timeout=2)
-                if ele:
-                    ele.input(password)
-                    log(f"Password filled using selector: {sel}")
-                    password_filled = True
-                    break
-            except:
-                continue
-        if not password_filled:
-            log("Failed to find password input", "WARN")
+        # Fill credentials using JS injection (works with SPA)
+        fill_login_form(page, email, password)
 
         # Click login
         log("Clicking login button...")
-        try:
-            page.ele('button[type="submit"]').click()
-        except:
-            try:
-                page.ele('button:contains("LOGIN")').click()
-            except:
-                page.run_js('document.querySelector("button[type=submit]")?.click()')
+        page.run_js('document.querySelector("button[type=submit]")?.click() || document.querySelector("button:contains(LOGIN)")?.click()')
 
         time.sleep(10)
         current_url = page.url
@@ -585,10 +549,7 @@ def main():
                     log("reCAPTCHA solved")
                     time.sleep(3)
                     # Re-click login
-                    try:
-                        page.ele('button[type="submit"]').click()
-                    except:
-                        page.run_js('document.querySelector("button[type=submit]")?.click()')
+                    page.run_js('document.querySelector("button[type=submit]")?.click()')
                     time.sleep(10)
                     current_url = page.url
                 except Exception as e:
@@ -751,4 +712,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
