@@ -189,6 +189,20 @@ def is_blocked(page):
         return False
 
 
+def wait_for_frame_ready(frame, timeout=20):
+    """Wait for a frame's document to reach readyState=complete."""
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            ready = frame.run_js("return document.readyState")
+            if ready == "complete":
+                return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+    return False
+
+
 def click_recaptcha_checkbox(page):
     """Click reCAPTCHA checkbox with retry logic"""
     anchor = find_recaptcha_frame(page, "anchor")
@@ -200,33 +214,69 @@ def click_recaptcha_checkbox(page):
             time.sleep(1)
     if not anchor:
         raise RuntimeError("reCAPTCHA anchor frame not found")
-    
+
+    # Wait for the anchor frame's document to be fully loaded (cross-origin iframe content needs time)
+    log("Waiting for reCAPTCHA anchor frame content to load...")
+    if not wait_for_frame_ready(anchor, timeout=20):
+        log("Anchor frame did not reach readyState=complete within 20s", "WARN")
+
+    # Diagnostic: log what's inside the anchor frame (helps debug "checkbox not found")
+    try:
+        body_snippet = anchor.run_js(
+            "return document.body ? document.body.innerHTML.substring(0, 300) : 'no body'"
+        ) or ""
+        log(f"Anchor frame body preview: {body_snippet[:200]}")
+    except Exception as e:
+        log(f"Could not read anchor frame content: {e}", "WARN")
+
     # Try multiple selectors for checkbox
     checkbox_selectors = [
         '#recaptcha-anchor',
         '[role="checkbox"]',
         '.recaptcha-checkbox-border',
         '.rc-anchor-checkbox',
+        '.recaptcha-checkbox',
+        '#recaptcha-anchor.recaptcha-checkbox',
     ]
-    
+
     checkbox = None
     for sel in checkbox_selectors:
         try:
-            checkbox = anchor.ele(sel, timeout=2)
+            checkbox = anchor.ele(sel, timeout=3)
             if checkbox:
                 log(f"Found checkbox using selector: {sel}")
                 break
-        except:
+        except Exception:
             continue
-    
+
     if not checkbox:
+        # Fallback: click the iframe element directly (the iframe IS the checkbox area visually)
+        log("Checkbox not found inside frame, trying to click iframe element directly", "WARN")
+        try:
+            iframe_ele = page.ele('xpath://iframe[contains(@src,"recaptcha/api2/anchor")]', timeout=2)
+            if iframe_ele:
+                log("Found anchor iframe element, clicking on it directly")
+                page.actions.move_to(iframe_ele, duration=random.uniform(0.4, 1.0))
+                time.sleep(random.uniform(0.2, 0.5))
+                try:
+                    iframe_ele.click()
+                except Exception:
+                    iframe_ele.click(by_js=True)
+                time.sleep(3)
+                if is_blocked(page):
+                    raise Exception("IP blocked by Google reCAPTCHA")
+                return
+        except Exception as e:
+            if "blocked" in str(e).lower():
+                raise
+            log(f"Iframe click fallback failed: {e}", "WARN")
         raise RuntimeError("reCAPTCHA checkbox not found")
-    
+
     page.actions.move_to(checkbox, duration=random.uniform(0.4, 1.0))
     time.sleep(random.uniform(0.2, 0.5))
     try:
         checkbox.click()
-    except:
+    except Exception:
         checkbox.click(by_js=True)
     time.sleep(3)
     if is_blocked(page):
