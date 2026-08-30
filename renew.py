@@ -10,6 +10,7 @@ import sys
 import time
 import random
 import html
+import signal
 import requests
 import tempfile
 from datetime import datetime
@@ -26,6 +27,12 @@ except ImportError:
 PANEL_URL = "https://panel.freegamehost.xyz"
 MAX_CAPTCHA_ATTEMPTS = 10
 SCREENSHOT_DIR = "output/screenshots"
+# Hard caps to prevent the script from hanging on Google's slow responses
+RELOAD_TIMEOUT_S = 15          # Max total time for reload_challenge to complete
+SWITCH_AUDIO_TIMEOUT_S = 12    # Max total time for switch_to_audio
+GET_AUDIO_URL_TIMEOUT_S = 6    # Max total time for get_audio_url polling
+ATTEMPT_TIMEOUT_S = 60         # Max time for a single solve_recaptcha attempt
+SOLVE_TOTAL_TIMEOUT_S = 480    # Max total time for solve_recaptcha (8 min)
 
 
 def log(msg, level="INFO"):
@@ -367,10 +374,12 @@ def is_audio_mode(page):
 
 
 def get_audio_url(page):
+    """Get audio URL from bframe. Capped at GET_AUDIO_URL_TIMEOUT_S seconds."""
     bframe = find_recaptcha_frame(page, "bframe")
     if not bframe:
         return None
-    for _ in range(10):
+    start = time.time()
+    while time.time() - start < GET_AUDIO_URL_TIMEOUT_S:
         try:
             link = bframe.ele('.rc-audiochallenge-tdownload-link', timeout=1)
             if link:
@@ -387,9 +396,9 @@ def get_audio_url(page):
                 src = audio.attr('src')
                 if src and len(src) > 10:
                     return html.unescape(src)
-        except:
+        except Exception:
             pass
-        time.sleep(1)
+        time.sleep(0.5)
     return None
 
 
@@ -408,6 +417,7 @@ def reload_challenge(page):
 
     old_url = get_audio_url(page)
     log(f"reload_challenge: old audio URL = {(old_url or 'None')[:80]}")
+    func_start = time.time()
     
     # Diagnostic: dump bframe HTML structure to find the actual reload button
     try:
@@ -505,7 +515,11 @@ def reload_challenge(page):
         """))
 
     # Try each strategy; verify by checking if URL changed within 1.5s after click
+    # HARD CAP: stop trying new strategies once RELOAD_TIMEOUT_S elapsed
     for name, fn in click_strategies():
+        if time.time() - func_start > RELOAD_TIMEOUT_S:
+            log(f"reload_challenge: hit total timeout ({RELOAD_TIMEOUT_S}s), bailing", "WARN")
+            break
         try:
             result = fn()
             if not result:
@@ -517,6 +531,9 @@ def reload_challenge(page):
             changed = False
             for i in range(8):
                 time.sleep(0.25)
+                if time.time() - func_start > RELOAD_TIMEOUT_S:
+                    log(f"reload_challenge: hit total timeout during verify, bailing", "WARN")
+                    break
                 new_url = get_audio_url(page)
                 # URL changed = reload worked
                 # OR: URL became None = challenge mode changed (image mode), which also means reload "happened"
@@ -773,7 +790,13 @@ def solve_recaptcha(page):
     dl_fails = 0
     last_text = None
     same_text_streak = 0
+    solve_start = time.time()
     for i in range(MAX_CAPTCHA_ATTEMPTS):
+        # HARD CAP: bail if total solve time exceeded
+        if time.time() - solve_start > SOLVE_TOTAL_TIMEOUT_S:
+            log(f"solve_recaptcha: total timeout ({SOLVE_TOTAL_TIMEOUT_S}s) exceeded, giving up", "ERROR")
+            break
+        attempt_start = time.time()
         log(f"--- Attempt {i+1}/{MAX_CAPTCHA_ATTEMPTS} ---")
         if is_recaptcha_solved(page):
             return True
@@ -845,6 +868,16 @@ def solve_recaptcha(page):
             continue
 
         log(f"Recognition result: [{text}]")
+
+        # HARD CAP per-attempt: if a single attempt takes > ATTEMPT_TIMEOUT_S, skip to next
+        if time.time() - attempt_start > ATTEMPT_TIMEOUT_S:
+            log(f"Attempt {i+1}: hit per-attempt timeout ({ATTEMPT_TIMEOUT_S}s), skipping to next", "WARN")
+            # Force a reload to try to recover
+            try:
+                reload_challenge(page)
+            except Exception:
+                pass
+            continue
 
         # Detect if we're stuck on the same audio (Google returned identical result)
         if text == last_text:
