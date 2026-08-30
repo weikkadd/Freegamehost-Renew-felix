@@ -108,28 +108,47 @@ def main():
             # ── 第一步：登录 ──
             log("正在打开登录页面...")
             sb.open(f"{PANEL_URL}/auth/login")
-            time.sleep(5)
+            time.sleep(8)  # 等待 JS 完全加载
 
             # 截图用于调试
             sb.save_screenshot("01_login_page.png")
             log(f"当前URL: {sb.get_current_url()}")
 
-            # 打印页面上所有输入框和按钮信息
-            log("=== 页面元素诊断 ===")
+            # 获取页面 HTML 片段用于调试
+            try:
+                body_html = sb.get_text("body")
+                log(f"页面文本长度: {len(body_html)}")
+                # 打印包含错误/失败/invalid 的行
+                lines = body_html.split('\n')
+                for line in lines:
+                    line_lower = line.lower()
+                    if any(kw in line_lower for kw in ['error', 'fail', 'invalid', '错误', '失败', 'invalid']):
+                        log(f"发现关键行: {line.strip()[:200]}")
+            except Exception as e:
+                log(f"获取页面文本失败: {e}")
+
+            # ── 诊断所有表单元素 ──
+            log("=== 所有表单元素 ===")
             all_inputs = sb.find_elements("input")
-            log(f"找到 {len(all_inputs)} 个 input 元素:")
+            log(f"共 {len(all_inputs)} 个 input:")
+            csrf_token = None
             for i, inp in enumerate(all_inputs):
                 try:
                     name = inp.get_attribute("name")
                     id_attr = inp.get_attribute("id")
-                    type_attr = inp.get_attribute("type")
+                    type_attr = inp.get_attribute("type") or "text"
+                    value = inp.get_attribute("value")
                     placeholder = inp.get_attribute("placeholder")
-                    log(f"  [{i}] name={name}, id={id_attr}, type={type_attr}, placeholder={placeholder}")
+                    log(f"  [{i}] type={type_attr}, name={name}, id={id_attr}, placeholder={placeholder}")
+                    # 检查 CSRF token
+                    if name and ('csrf' in name.lower() or 'token' in name.lower()):
+                        csrf_token = value
+                        log(f"  ⚠️ 发现可能的 CSRF token: {value[:20] if value else 'None'}...")
                 except Exception:
                     pass
 
             all_buttons = sb.find_elements("button")
-            log(f"找到 {len(all_buttons)} 个 button 元素:")
+            log(f"共 {len(all_buttons)} 个 button:")
             for i, btn in enumerate(all_buttons):
                 try:
                     text = btn.text.strip()[:50]
@@ -138,129 +157,122 @@ def main():
                 except Exception:
                     pass
 
-            # 检查是否有错误提示
-            error_elements = sb.find_elements('.alert, .error, .invalid, [class*="error"], [class*="invalid"], [class*="danger"]')
-            if error_elements:
-                log(f"发现错误提示: {error_elements[0].text[:100] if error_elements else 'N/A'}")
-
-            # 尝试登录 - 多种字段名
+            # ── 尝试登录 ──
             logged_in = False
+            attempts = 0
 
-            # 方案1: username + password
-            try:
-                if sb.is_element_present('input[name="username"]'):
-                    sb.type('input[name="username"]', email)
-                    log("已填入用户名")
-                elif sb.is_element_present('input[name="email"]'):
-                    sb.type('input[name="email"]', email)
-                    log("已填入邮箱")
-                else:
-                    # 找第一个 text/email 类型的输入框
-                    inputs = sb.find_elements('input[type="text"], input[type="email"]')
-                    if inputs:
-                        sb.type(inputs[0], email)
-                        log(f"已填入第一个文本输入框")
+            while not logged_in and attempts < 2:
+                attempts += 1
+                log(f"\n=== 登录尝试 {attempts} ===")
 
-                if sb.is_element_present('input[name="password"]'):
-                    sb.type('input[name="password"]', password)
-                    log("已填入密码")
-                elif sb.is_element_present('input[type="password"]'):
-                    sb.type('input[type="password"]', password)
-                    log("已填入密码")
-
-            except Exception as e:
-                log(f"填入凭证时出错: {e}")
-
-            # 点击登录
-            login_selectors = [
-                'button[type="submit"]',
-                'button:contains("Login")',
-                'button:contains("Sign")',
-                '#login-button',
-                '.btn-primary',
-                'button:contains("登录")',
-            ]
-
-            clicked = False
-            for sel in login_selectors:
+                # 重新定位元素（防止页面刷新导致元素丢失）
                 try:
-                    if sb.is_element_present(sel):
-                        sb.click(sel)
-                        clicked = True
-                        log(f"已点击登录按钮: {sel}")
-                        break
+                    user_input = sb.wait_for_element('input[name="username"]', timeout=5)
+                    pass_input = sb.wait_for_element('input[name="password"]', timeout=5)
+                    log("✅ 找到登录表单")
                 except Exception:
-                    continue
-
-            if not clicked:
-                buttons = sb.find_elements("button")
-                for btn in buttons:
+                    # 尝试其他选择器
                     try:
-                        text = btn.text.strip().lower()
-                        if "login" in text or "sign" in text or "登录" in text:
-                            sb.click(btn)
-                            clicked = True
-                            log(f"通过文本匹配点击: {text}")
-                            break
+                        user_input = sb.wait_for_element('input[type="text"]', timeout=5)
+                        pass_input = sb.wait_for_element('input[type="password"]', timeout=5)
+                        log("✅ 通过类型找到输入框")
                     except Exception:
-                        continue
+                        log("❌ 找不到登录输入框")
+                        sb.save_screenshot("error_no_form.png")
+                        break
 
-            if not clicked:
-                # 最后尝试按回车
-                log("尝试按回车提交")
-                sb.send_keys('input[type="password"]', "\n")
-
-            # 等待页面跳转
-            log("等待登录响应...")
-            time.sleep(10)
-            sb.save_screenshot("02_after_login.png")
-
-            current_url = sb.get_current_url()
-            log(f"登录后URL: {current_url}")
-
-            # 检查是否还在登录页
-            if "auth/login" in current_url or "login" in current_url:
-                # 检查是否有错误消息
-                error_text = ""
+                # 清空并填入
                 try:
-                    alerts = sb.find_elements('.alert, .error-message, [class*="error"], [class*="invalid"], .text-danger, .bg-danger')
-                    for alert in alerts:
-                        t = alert.text.strip()
-                        if t and len(t) > 3:
-                            error_text = t
-                            log(f"发现错误消息: {error_text[:200]}")
-                            break
-                except Exception:
-                    pass
+                    user_input.clear()
+                    user_input.send_keys(email)
+                    log(f"已填入用户名: {email}")
+                except Exception as e:
+                    log(f"填入用户名失败: {e}")
 
-                if not error_text:
-                    # 检查 body 中是否有错误文本
+                try:
+                    pass_input.clear()
+                    pass_input.send_keys(password)
+                    log(f"已填入密码 (长度{len(password)})")
+                except Exception as e:
+                    log(f"填入密码失败: {e}")
+
+                # 点击登录
+                try:
+                    sb.click('button[type="submit"]')
+                    log("已点击 LOGIN 按钮")
+                except Exception:
                     try:
-                        body_text = sb.get_text("body")
-                        if "错误" in body_text or "error" in body_text.lower() or "invalid" in body_text.lower():
-                            # 提取错误相关文本
+                        sb.click('button:contains("LOGIN")')
+                        log("已点击 LOGIN 按钮 (第二种选择器)")
+                    except Exception as e:
+                        log(f"点击登录按钮失败: {e}")
+                        sb.save_screenshot("error_click_fail.png")
+                        break
+
+                # 等待跳转
+                log("等待登录响应...")
+                time.sleep(12)
+
+                current_url = sb.get_current_url()
+                log(f"登录后URL: {current_url}")
+
+                if "auth/login" not in current_url and "login" not in current_url:
+                    log("✅ 登录成功！")
+                    logged_in = True
+                    sb.save_screenshot("02_logged_in.png")
+                else:
+                    # 检查错误消息
+                    log("\n=== 检查错误消息 ===")
+                    error_found = False
+
+                    # 方法1: 查找 alert/error 类元素
+                    for selector in ['.alert', '.error', '.invalid', '[class*="error"]',
+                                    '[class*="invalid"]', '.text-danger', '.bg-danger',
+                                    '.flash-error', '.notification-error']:
+                        try:
+                            el = sb.wait_for_element(selector, timeout=2)
+                            text = el.text.strip()
+                            if text:
+                                log(f"发现错误 [{selector}]: {text[:200]}")
+                                error_found = True
+                                break
+                        except Exception:
+                            continue
+
+                    # 方法2: 在 body 文本中搜索
+                    if not error_found:
+                        try:
+                            body_text = sb.get_text("body")
                             lines = body_text.split('\n')
                             for line in lines:
                                 line = line.strip()
-                                if len(line) > 5 and ('错误' in line or 'error' in line.lower() or 'invalid' in line.lower()):
-                                    error_text = line[:200]
-                                    log(f"从页面文本发现错误: {error_text}")
+                                if len(line) > 3 and any(kw in line.lower() for kw in
+                                    ['错误', '失败', 'invalid', 'error', 'wrong', 'incorrect', '无效']):
+                                    log(f"发现错误文本: {line[:200]}")
+                                    error_found = True
                                     break
-                    except Exception:
-                        pass
+                        except Exception:
+                            pass
 
-                log("登录失败：仍在登录页面")
-                sb.save_screenshot("error_login_failed.png")
-                error_msg = f"登录失败，仍在登录页面。{'错误: ' + error_text if error_text else ''}"
+                    if not error_found:
+                        log("未检测到明确错误消息，但仍在登录页面")
+
+                    sb.save_screenshot(f"03_login_attempt{attempts}_failed.png")
+
+                    # 如果第二次尝试仍然失败，放弃
+                    if attempts >= 2:
+                        break
+
+            if not logged_in:
+                error_msg = "登录失败：账号密码错误或需要额外验证"
+                sb.save_screenshot("error_login_final.png")
                 raise Exception(error_msg)
-
-            log("✅ 登录成功！")
 
             # ── 第二步：前往仪表盘 ──
             log("正在打开仪表盘...")
             sb.open(f"{PANEL_URL}/")
             time.sleep(5)
-            sb.save_screenshot("03_dashboard.png")
+            sb.save_screenshot("04_dashboard.png")
 
             # ── 第三步：点击 Renew 按钮 ──
             renew_selectors = [
@@ -312,7 +324,7 @@ def main():
                     log(f"遍历链接失败: {e}")
 
             time.sleep(5)
-            sb.save_screenshot("04_after_renew.png")
+            sb.save_screenshot("05_after_renew.png")
 
             if renewed:
                 log("✅ 续期成功！")
