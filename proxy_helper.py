@@ -376,12 +376,14 @@ def build_singbox_config(proxy: dict, listen_port: int = 10808) -> dict:
         outbound = {k: v for k, v in outbound.items() if v is not None}
     
     elif proxy['protocol'] == 'vmess':
-        security = 'tls' if proxy.get('tls') in ('tls', 'auto') and proxy.get('sni') else 'none'
+        # 部分订阅只有 tls 标记但没有独立 sni 字段, 此时回退用 ws host 作 server_name
+        vmess_sni = proxy.get('sni') or proxy.get('host_header')
+        security = 'tls' if proxy.get('tls') in ('tls', 'auto') and vmess_sni else 'none'
         tls = {}
         if security == 'tls':
             tls = {
                 "enabled": True,
-                "server_name": proxy.get('sni', proxy['host']),
+                "server_name": vmess_sni or proxy['host'],
                 "utls": {
                     "enabled": True,
                     "fingerprint": "chrome",
@@ -597,29 +599,41 @@ class ProxyManager:
             log(f"Failed to write sing-box config: {e}", "ERROR")
             return False
         
-        # Start sing-box as subprocess
+        # stderr 重定向到文件而非 PIPE:
+        #  - PIPE 的 read() 在 sing-box 进程存活时会一直阻塞等待 EOF, 导致脚本卡死
+        #  - PIPE 缓冲满还会反过来阻塞 sing-box 写日志
+        log_file = f"/tmp/singbox_stderr_{os.getpid()}.log"
+        try:
+            stderr_fd = open(log_file, 'w')
+        except Exception as e:
+            log(f"Failed to open stderr log file: {e}", "ERROR")
+            return False
         try:
             self.singbox_proc = subprocess.Popen(
                 [self.singbox_path, 'run', '-c', self.config_path],
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
+                stderr=stderr_fd,
             )
         except Exception as e:
             log(f"Failed to start sing-box: {e}", "ERROR")
+            stderr_fd.close()
             return False
-        
+
         # Wait for sing-box to be ready (socks5 port should be reachable)
         if not wait_for_port('127.0.0.1', self.LISTEN_PORT, timeout=10):
             log("sing-box failed to start listening on socks5 port", "ERROR")
-            # Read stderr for diagnostics
+            # 从日志文件读 stderr 诊断(非阻塞)
             try:
-                stderr = self.singbox_proc.stderr.read().decode('utf-8', errors='ignore') if self.singbox_proc.stderr else ''
-                if stderr:
+                with open(log_file, 'r', errors='ignore') as f:
+                    stderr = f.read()
+                if stderr.strip():
                     log(f"sing-box stderr: {stderr[:1000]}", "ERROR")
             except Exception:
                 pass
+            stderr_fd.close()
             self.stop()
             return False
+        stderr_fd.close()
         
         log(f"✓ sing-box listening on socks5://127.0.0.1:{self.LISTEN_PORT}")
         return True

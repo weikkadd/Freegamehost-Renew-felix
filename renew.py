@@ -10,6 +10,7 @@ import sys
 import time
 import random
 import html
+import json
 import signal
 import requests
 import tempfile
@@ -53,7 +54,8 @@ def log(msg, level="INFO"):
 def send_tg(token, chat_id, text):
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
-        data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
+        # parse_mode=HTML 时特殊字符必须转义, 否则 Telegram API 会报错导致通知失败
+        data = {"chat_id": chat_id, "text": html.escape(text), "parse_mode": "HTML"}
         r = requests.post(url, data=data, timeout=30)
         r.raise_for_status()
         log("Telegram notification sent")
@@ -84,6 +86,9 @@ def fill_login_form(page, email, password):
     """Fill login form using JS injection (SPA compatible)"""
     log("Filling login info...")
     
+    # 用 JSON 转义嵌入 JS, 防止邮箱/密码含引号、反斜杠、换行等破坏脚本或注入
+    email_js = json.dumps(email)
+    password_js = json.dumps(password)
     result = page.run_js(f"""
         const inputs = document.querySelectorAll('input');
         let usernameFilled = false;
@@ -94,12 +99,12 @@ def fill_login_form(page, email, password):
             const placeholder = (inp.placeholder || '').toLowerCase();
             
             if (!usernameFilled && (type === 'email' || type === 'text' || placeholder.includes('email') || placeholder.includes('user'))) {{
-                inp.value = '{email}';
+                inp.value = {email_js};
                 inp.dispatchEvent(new Event('input', {{bubbles: true}}));
                 inp.dispatchEvent(new Event('change', {{bubbles: true}}));
                 usernameFilled = true;
             }} else if (!passwordFilled && type === 'password') {{
-                inp.value = '{password}';
+                inp.value = {password_js};
                 inp.dispatchEvent(new Event('input', {{bubbles: true}}));
                 inp.dispatchEvent(new Event('change', {{bubbles: true}}));
                 passwordFilled = true;
@@ -1079,10 +1084,14 @@ def rotate_proxy():
         log("No proxy manager or no proxies loaded", "WARN")
         return False
     
+    # IP 验证必须走 socks5 代理, 否则拿到的是 runner 直连 IP(轮换前后永远相同, 验证无效)
+    proxy_url = _proxy_manager.get_socks5_url()
+    ip_proxies = {"http": proxy_url, "https": proxy_url}
+
     # Get current IP before rotation (if proxy was active)
     old_ip = None
     try:
-        r = requests.get("https://api.ipify.org", timeout=10)
+        r = requests.get("https://api.ipify.org", timeout=10, proxies=ip_proxies)
         old_ip = r.text.strip()
     except Exception:
         pass
@@ -1091,7 +1100,7 @@ def rotate_proxy():
     if _proxy_manager.rotate():
         # Verify new IP is different
         try:
-            r = requests.get("https://api.ipify.org", timeout=10)
+            r = requests.get("https://api.ipify.org", timeout=10, proxies=ip_proxies)
             new_ip = r.text.strip()
             info = _proxy_manager.current_proxy_info()
             log(f"✓ Proxy rotated: {info['protocol']} → {info['host']}:{info['port']} (IP: {new_ip})")
@@ -1197,7 +1206,13 @@ def main():
             page.get_screenshot(f"{SCREENSHOT_DIR}/01_login_page.png")
             
             debug_page(page)
-            fill_login_form(page, email, password)
+            fill_ok = fill_login_form(page, email, password)
+            if not fill_ok:
+                log("Login form fill failed, retrying once...", "WARN")
+                time.sleep(3)
+                fill_ok = fill_login_form(page, email, password)
+            if not fill_ok:
+                log("Login form fill failed after retry, continuing anyway", "WARN")
 
             log("Clicking login button...")
             page.run_js('document.querySelector("button[type=submit]")?.click()')
