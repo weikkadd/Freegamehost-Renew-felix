@@ -444,8 +444,12 @@ def main():
         co.set_argument('--log-level=3')
         co.headless(False)
 
-        # 反指纹
-        co.add_init_js("""
+        # 启动浏览器
+
+        page = ChromiumPage(co)
+
+        # ── 反指纹 ──
+        page.run_js("""
             const getParameter = WebGLRenderingContext.prototype.getParameter;
             WebGLRenderingContext.prototype.getParameter = function(parameter) {
                 if (parameter === 37445) return 'Intel Inc.';
@@ -456,8 +460,6 @@ def main():
             Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
             Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
         """)
-
-        page = ChromiumPage(co)
 
         # ── 访问登录页 ──
         log("正在打开登录页面...")
