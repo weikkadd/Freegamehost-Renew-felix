@@ -1073,13 +1073,21 @@ def rotate_warp_ip():
     #   - just call without flag (some versions have TOS pre-accepted)
     
     def run_warp_cmd(args):
-        """Try warp-cli with multiple TOS-accept strategies. Returns combined stdout+stderr."""
+        """Try warp-cli with multiple TOS-accept strategies. Returns combined stdout+stderr.
+        
+        Critical: --accept-tos must come BEFORE the subcommand (verified from fscarmen's action):
+            sudo warp-cli --accept-tos registration new    ← correct
+            warp-cli disconnect --accept-tos                ← WRONG (gives Usage error)
+        """
         env = os.environ.copy()
-        env['WARP_CLI_ACCEPT_TOS'] = '1'  # Common env var for accepting TOS
+        env['WARP_CLI_ACCEPT_TOS'] = '1'
+        # Each variant uses CORRECT --accept-tos position (before subcommand)
+        # Different invocation styles in case sudo is needed or not
         for variant in [
-            ['sudo'] + args,                       # Try with sudo (TOS pre-accepted by root)
-            args + ['--accept-tos'],               # Try with --accept-tos flag
-            args,                                  # Try plain (in case TOS already accepted)
+            ['sudo', 'warp-cli', '--accept-tos'] + args[2:],   # sudo + flag (correct syntax)
+            ['warp-cli', '--accept-tos'] + args[2:],           # plain + flag (correct syntax)
+            ['sudo'] + args,                                    # sudo without flag (root TOS pre-accepted)
+            args,                                               # plain (in case TOS already accepted)
         ]:
             try:
                 result = subprocess.run(
