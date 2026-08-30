@@ -5,7 +5,7 @@
 ## ⭐ 功能特性
 
 - 🔓 **全自动 reCAPTCHA 破解** — 音频识别 + 自动填写，无需人工干预
-- 🌐 **智能 IP 切换** — 检测到 Google 封锁后自动通过 WARP 更换出口 IP
+- 🌐 **智能代理轮换** — 检测到 Google 封锁后自动切换到下一个 v2rayN 代理节点（支持 vless/vmess/trojan/ss）
 - 📱 **Telegram 通知** — 续期成功/失败均推送消息，附带页面截图
 - ⏰ **定时 + 手动运行** — 默认每 4 小时自动执行，也支持手动触发
 - 🧹 **自动清理运行记录** — 只保留最近 2 条 Actions 记录，仓库保持清爽
@@ -20,9 +20,27 @@
 | Secret | 必填 | 格式 | 说明 |
 |--------|:----:|------|------|
 | 🔑 `FGH_ACCOUNT` | ✅ | `邮箱,密码` | FreeGameHost 登录账号，例如 `user@example.com,password123` |
+| 🌐 `PROXY_URI` | 推荐 | v2rayN 链接 | v2rayN 客户端复制的代理链接（vless/vmess/trojan/ss），支持多个换行分隔。详见下方说明 |
 | 📨 `TG_BOT_TOKEN` | 可选 | `数字:字母数字` | Telegram Bot Token，用于推送通知 |
 | 📨 `TG_CHAT_ID` | 可选 | `数字` | Telegram Chat ID，接收通知的目标 |
-| 🌐 `GOST_PROXY` | 可选 | `socks5://user:pass@host:port` | 备用代理，不填则直连 |
+
+### PROXY_URI 格式说明
+
+`PROXY_URI` 接受 v2rayN 客户端"复制链接"功能导出的链接，支持以下协议：
+
+| 协议 | 链接前缀 | 示例 |
+|------|---------|------|
+| **VLESS** | `vless://` | `vless://uuid@host:443?type=ws&security=tls&sni=example.com&path=%2F#name` |
+| **VMess** | `vmess://` | `vmess://eyJ2IjoiMiIsImFkZCI6...`（base64 编码 JSON） |
+| **Trojan** | `trojan://` | `trojan://password@host:443?sni=host.com#name` |
+| **Shadowsocks** | `ss://` | `ss://aes-256-gcm:password@host:8388#name` |
+
+**多节点轮换**：用换行符（在 GitHub Secrets 输入框里直接回车）分隔多个链接，reCAPTCHA 被封时自动切换下一个节点。
+
+**如何获取链接**：
+- v2rayN 客户端 → 右键节点 → "复制链接"
+- Clash Verge → 节点 → "分享 URL"
+- 直接从机场订阅里复制单条链接
 
 ### 如何获取 Telegram 信息？
 
@@ -61,16 +79,16 @@ Fork 本仓库并完成 Secrets 配置后，工作流会按以下时间自动执
 
 脚本内置了音频识别流程，但如果识别率较低，可能是以下原因：
 - **网络问题**：Google 语音识别 API 访问不稳定，脚本会自动重试（最多 3 次下载、多次识别）
-- **IP 被标记**：频繁操作会导致 Google 展示更难的验证码，脚本会通过 WARP 自动更换 IP
+- **IP 被标记**：频繁操作会导致 Google 展示更难的验证码，脚本会自动切换到下一个 PROXY_URI 节点
 - **环境噪音**：建议检查 Actions 日志中的识别结果 `[INFO] 识别结果: [xxxx]`
 
 ### 2. IP 被封锁导致无法继续？
 
-当检测到 `try again later` 或错误提示时，脚本会自动调用 WARP 断开并重新连接，以更换出口 IP，然后重新开始续期尝试。整个流程最多尝试 **50 次**，足够应对大多数封锁情况。
+当检测到 Google reCAPTCHA 封锁（verify button 长期 disabled）时，脚本会自动调用 `xray-core` 切换到下一个 `PROXY_URI` 节点，重启 Chrome 后重新尝试续期。整个流程最多尝试 **5 次** 代理切换。
 
-### 3. 为什么需要 WARP？
+### 3. 为什么需要代理？
 
-FreeGameHost 面板嵌入了 Google reCAPTCHA。当短时间内多次尝试验证时，Google 可能会封禁当前 IP。WARP 能快速更换 Cloudflare 出口 IP，绕过封锁继续验证。
+FreeGameHost 面板嵌入了 Google reCAPTCHA。当短时间内多次尝试验证时，Google 可能会封禁当前 IP。`PROXY_URI` 接受 v2rayN 客户端链接格式，通过 `xray-core` 在本地启动 socks5 代理，Chrome 通过该代理访问面板。被封后自动切换到下一个节点，每个节点都有独立的出口 IP。
 
 ### 4. 没有收到 Telegram 通知？
 

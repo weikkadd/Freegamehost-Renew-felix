@@ -17,6 +17,9 @@ from datetime import datetime
 from xvfbwrapper import Xvfb
 from DrissionPage import ChromiumPage, ChromiumOptions
 
+# Import proxy helper for v2rayN link support
+from proxy_helper import ProxyManager, parse_proxy_uri, log as proxy_log
+
 try:
     import speech_recognition as sr
     from pydub import AudioSegment
@@ -1047,98 +1050,58 @@ def solve_recaptcha(page):
     raise RuntimeError("Max captcha attempts reached")
 
 
-def rotate_warp_ip():
-    """Rotate Cloudflare WARP exit IP by re-registering WARP account.
+# Global ProxyManager instance — initialized in main()
+_proxy_manager: ProxyManager = None
+
+
+def init_proxy_manager():
+    """Initialize global ProxyManager from PROXY_URI env var.
     
-    Returns True if rotation succeeded AND new IP differs from previous, False otherwise.
-    
-    IMPORTANT: disconnect+connect does NOT change the exit IP because Cloudflare
-    keeps the same account/IP mapping across reconnects. To actually get a new IP,
-    we must delete the current registration and create a new one:
-      warp-cli registration delete
-      warp-cli registration new
-    This is exactly what fscarmen/warp-on-actions@v1.3 does during initial setup.
+    PROXY_URI format: v2rayN client link (vless/vmess/trojan/ss).
+    Multiple proxies separated by newlines.
     """
-    import subprocess
-    import shutil
+    global _proxy_manager
+    _proxy_manager = ProxyManager()
+    count = _proxy_manager.add_proxies_from_env("PROXY_URI")
+    if count == 0:
+        log("PROXY_URI not set or no valid proxies parsed — running without proxy", "WARN")
+        return False
+    if not _proxy_manager.xray_path:
+        log("xray binary not found — proxy cannot be used", "ERROR")
+        return False
+    return True
+
+
+def rotate_proxy():
+    """Rotate to next proxy in list. Returns True if successful."""
+    global _proxy_manager
+    if not _proxy_manager or not _proxy_manager.proxies:
+        log("No proxy manager or no proxies loaded", "WARN")
+        return False
     
-    # Get current IP first
+    # Get current IP before rotation (if proxy was active)
+    old_ip = None
     try:
         r = requests.get("https://api.ipify.org", timeout=10)
         old_ip = r.text.strip()
-        log(f"Rotating WARP IP via re-registration... (current IP: {old_ip})")
     except Exception:
-        old_ip = None
-        log("Rotating WARP IP via re-registration... (could not get current IP)")
+        pass
     
-    # Find warp-cli binary
-    warp_cli_path = shutil.which('warp-cli') or '/usr/local/bin/warp-cli'
-    log(f"  warp-cli path: {warp_cli_path}")
-    
-    def run_warp_cmd(subcmd):
-        """Run 'sudo warp-cli --accept-tos <subcmd>'. Returns output string or '' on failure."""
-        env = os.environ.copy()
-        env['WARP_CLI_ACCEPT_TOS'] = '1'
-        cmd = ['sudo', warp_cli_path, '--accept-tos'] + subcmd.split()
-        log(f"    running: {' '.join(cmd)}")
+    log(f"Rotating proxy... (current IP: {old_ip})")
+    if _proxy_manager.rotate():
+        # Verify new IP is different
         try:
-            result = subprocess.run(
-                cmd, env=env, capture_output=True, text=True, timeout=30
-            )
-            output = ((result.stdout or '') + (result.stderr or '')).strip()
-            if output:
-                log(f"    output: {output[:200]}")
-            if result.returncode != 0:
-                log(f"    exit code: {result.returncode}", "WARN")
-            return output
-        except subprocess.TimeoutExpired:
-            log(f"    command timed out (30s)", "WARN")
-            return ""
+            r = requests.get("https://api.ipify.org", timeout=10)
+            new_ip = r.text.strip()
+            info = _proxy_manager.current_proxy_info()
+            log(f"✓ Proxy rotated: {info['protocol']} → {info['host']}:{info['port']} (IP: {new_ip})")
+            return True
         except Exception as e:
-            log(f"    exception: {type(e).__name__}: {e}", "WARN")
-            return ""
-    
-    # Re-registration strategy: this is the ONLY reliable way to get a new WARP IP
-    # Steps:
-    #   1. disconnect (clean shutdown)
-    #   2. registration delete (delete current account)
-    #   3. registration new (create new account → Cloudflare assigns new IP)
-    #   4. mode warp+doh (re-apply the mode fscarmen action uses)
-    #   5. connect (start using new registration)
-    #   6. wait for IP to settle
-    for attempt in range(3):
-        try:
-            log(f"  attempt {attempt+1}/3: full re-registration cycle...")
-            run_warp_cmd('disconnect')
-            time.sleep(2)
-            run_warp_cmd('registration delete')
-            time.sleep(2)
-            run_warp_cmd('registration new')
-            time.sleep(3)
-            # Re-apply mode (registration new resets it)
-            run_warp_cmd('mode warp+doh')
-            time.sleep(1)
-            run_warp_cmd('connect')
-            time.sleep(8)  # WARP needs time to establish connection
-            
-            # Verify new IP
-            try:
-                r = requests.get("https://api.ipify.org", timeout=10)
-                new_ip = r.text.strip()
-                if new_ip != old_ip:
-                    log(f"  ✓ WARP IP changed: {old_ip} → {new_ip}")
-                    return True
-                else:
-                    log(f"  IP unchanged ({new_ip}), will retry re-registration", "WARN")
-            except Exception as e:
-                log(f"  failed to verify new IP: {e}", "WARN")
-                return True
-        except Exception as e:
-            log(f"  WARP re-registration attempt {attempt+1} failed: {e}", "WARN")
-        time.sleep(3)
-    
-    log("WARP rotation failed after 3 re-registration attempts", "ERROR")
-    return False
+            log(f"Proxy rotated but couldn't verify IP: {e}", "WARN")
+            return True
+    else:
+        log("Proxy rotation failed", "ERROR")
+        return False
 
 
 def capture_screenshot(page, filename):
@@ -1166,6 +1129,23 @@ def main():
     tg_token = os.environ.get("TG_BOT_TOKEN", "").strip()
     tg_chat_id = os.environ.get("TG_CHAT_ID", "").strip()
 
+    # Initialize proxy manager and start first proxy if PROXY_URI is set
+    proxy_active = init_proxy_manager()
+    proxy_url = None
+    if proxy_active:
+        if _proxy_manager.start(0):
+            proxy_url = _proxy_manager.get_socks5_url()
+            log(f"Browser will use proxy: {proxy_url}")
+            # Verify proxy is working by checking exit IP
+            try:
+                r = requests.get("https://api.ipify.org", timeout=15,
+                                proxies={"http": proxy_url, "https": proxy_url})
+                log(f"Proxy exit IP: {r.text.strip()}")
+            except Exception as e:
+                log(f"Proxy verification failed: {e}", "WARN")
+        else:
+            log("Failed to start proxy, continuing without proxy", "WARN")
+
     vdisplay = Xvfb(width=1920, height=1080, colordepth=24)
     vdisplay.start()
 
@@ -1185,6 +1165,10 @@ def main():
         co.set_argument('--no-default-browser-check')
         co.set_argument('--window-size=1920,1080')
         co.set_argument('--log-level=3')
+        # Use socks5 proxy if active
+        if proxy_url:
+            co.set_argument(f'--proxy-server={proxy_url}')
+            log(f"Chrome will route through: {proxy_url}")
         co.headless(False)
 
         page = ChromiumPage(co)
@@ -1201,11 +1185,11 @@ def main():
             Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
         """)
 
-        # Retry loop for login + reCAPTCHA — on IP block, rotate WARP and retry
+        # Retry loop for login + reCAPTCHA — on IP block, rotate proxy and retry
         MAX_IP_ROTATIONS = 5
         for ip_attempt in range(MAX_IP_ROTATIONS):
             if ip_attempt > 0:
-                log(f"=== Retry attempt {ip_attempt+1}/{MAX_IP_ROTATIONS} after WARP IP rotation ===")
+                log(f"=== Retry attempt {ip_attempt+1}/{MAX_IP_ROTATIONS} after proxy rotation ===")
             
             log("Opening login page...")
             page.get(f"{PANEL_URL}/auth/login")
@@ -1236,9 +1220,9 @@ def main():
                         current_url = page.url
                     except Exception as e:
                         err_str = str(e)
-                        # Detect IP-blocked exception → rotate WARP and retry
+                        # Detect IP-blocked exception → rotate proxy and retry
                         if "IP blocked by Google reCAPTCHA" in err_str:
-                            log(f"reCAPTCHA IP blocked, will rotate WARP and retry", "WARN")
+                            log(f"reCAPTCHA IP blocked, will rotate proxy and retry", "WARN")
                             page.get_screenshot(f"{SCREENSHOT_DIR}/error_captcha_blocked_{ip_attempt+1}.png")
                             ip_blocked = True
                         else:
@@ -1248,14 +1232,15 @@ def main():
                             raise
 
             if ip_blocked:
-                # Rotate WARP IP and retry the whole login + reCAPTCHA flow
+                # Rotate proxy and retry the whole login + reCAPTCHA flow
                 if ip_attempt + 1 < MAX_IP_ROTATIONS:
-                    log(f"Rotating WARP IP (attempt {ip_attempt+1}/{MAX_IP_ROTATIONS})...")
-                    rotate_warp_ip()
-                    # Re-open login page on new IP, fresh reCAPTCHA challenge
+                    log(f"Rotating proxy (attempt {ip_attempt+1}/{MAX_IP_ROTATIONS})...")
+                    if not rotate_proxy():
+                        log("Proxy rotation failed, retrying with same proxy", "WARN")
+                        time.sleep(5)
                     continue
                 else:
-                    error_msg = "Max IP rotations reached, Google reCAPTCHA still blocking"
+                    error_msg = "Max proxy rotations reached, Google reCAPTCHA still blocking"
                     log(f"ERROR: {error_msg}", "ERROR")
                     raise Exception(error_msg)
 
@@ -1415,6 +1400,9 @@ def main():
         except:
             pass
         vdisplay.stop()
+        # Stop xray if running
+        if _proxy_manager:
+            _proxy_manager.stop()
 
     # Telegram notification
     if tg_token and tg_chat_id:

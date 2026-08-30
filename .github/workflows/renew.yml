@@ -31,20 +31,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install DrissionPage xvfbwrapper requests SpeechRecognition pydub
 
-      - name: 🌐 启用 WARP 网络
-        uses: fscarmen/warp-on-actions@v1.3
-        with:
-          stack: dual
-          mode: client
+      - name: 📥 安装 xray-core
+        run: |
+          XRAY_VERSION="v25.8.21"
+          wget -q -O /tmp/xray.zip "https://github.com/XTLS/Xray-core/releases/download/${XRAY_VERSION}/Xray-linux-64.zip"
+          sudo mkdir -p /usr/local/share/xray
+          sudo unzip -q /tmp/xray.zip -d /usr/local/share/xray
+          sudo cp /usr/local/share/xray/xray /usr/local/bin/xray
+          sudo chmod +x /usr/local/bin/xray
+          xray version
 
       - name: 🔍 网络诊断
         run: |
-          echo "=== DNS 配置 ==="
-          cat /etc/resolv.conf
-          echo ""
           echo "=== 当前 IP ==="
           curl -s --max-time 10 https://api.ipify.org && echo
-          curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=' || true
           echo ""
           echo "=== 测试访问 FreeGameHost ==="
           curl -s --max-time 15 -o /dev/null -w "HTTP %{http_code}, Time: %{time_total}s\n" https://panel.freegamehost.xyz/auth/login
@@ -53,7 +53,7 @@ jobs:
         env:
           PYTHONIOENCODING: utf-8
           FGH_ACCOUNT: ${{ secrets.FGH_ACCOUNT }}
-          GOST_PROXY: ${{ secrets.GOST_PROXY }}
+          PROXY_URI: ${{ secrets.PROXY_URI }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
         run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
