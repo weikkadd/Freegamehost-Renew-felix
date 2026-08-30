@@ -32,6 +32,75 @@ MAX_CAPTCHA_ATTEMPTS = 3
 SCREENSHOT_DIR = "output/screenshots"
 
 
+def fill_login_form(page, email, password):
+    """Fill login form - handles SPA/iframe content"""
+    log("Filling login info...")
+    
+    username_filled = False
+    password_filled = False
+    
+    # Try different selectors
+    for sel in ['input[name="username"]', 'input[type="email"]', 'input[placeholder*="email" i]', 'input[id="username"]']:
+        try:
+            ele = page.ele(sel, timeout=2)
+            if ele:
+                ele.input(email)
+                log(f"Username filled using: {sel}")
+                username_filled = True
+                break
+        except:
+            continue
+    
+    if not username_filled:
+        # Try any visible text/email input
+        try:
+            inputs = page.eles('input')
+            for inp in inputs:
+                try:
+                    inp_type = inp.attr('type') or ''
+                    inp_placeholder = (inp.attr('placeholder') or '').lower()
+                    if inp_type in ['text', 'email', ''] or 'email' in inp_placeholder or 'user' in inp_placeholder:
+                        inp.input(email)
+                        log(f"Username filled in input type={inp_type}")
+                        username_filled = True
+                        break
+                except:
+                    continue
+        except:
+            pass
+    
+    # Password
+    for sel in ['input[name="password"]', 'input[type="password"]']:
+        try:
+            ele = page.ele(sel, timeout=2)
+            if ele:
+                ele.input(password)
+                log(f"Password filled using: {sel}")
+                password_filled = True
+                break
+        except:
+            continue
+    
+    if not password_filled:
+        try:
+            inputs = page.eles('input')
+            for inp in inputs:
+                if inp.attr('type') == 'password':
+                    inp.input(password)
+                    log("Password filled in password input")
+                    password_filled = True
+                    break
+        except:
+            pass
+    
+    if not username_filled:
+        log("Failed to fill username", "WARN")
+    if not password_filled:
+        log("Failed to fill password", "WARN")
+    
+    return username_filled and password_filled
+
+
 def debug_page(page):
     """Debug: print all page elements"""
     log("=" * 50)
@@ -526,40 +595,23 @@ def main():
             page.get(f"{PANEL_URL}/auth/login")
             time.sleep(15)
 
-        # Fill credentials with multiple selector attempts
-        log("Filling login info...")
-        
-        # Try different selectors for username
-        username_selectors = ['input[name="username"]', 'input[type="email"]', 'input[placeholder*="email" i]', '#username']
-        username_filled = False
-        for sel in username_selectors:
-            try:
-                ele = page.ele(sel, timeout=2)
-                if ele:
-                    ele.input(email)
-                    log(f"Username filled using selector: {sel}")
-                    username_filled = True
-                    break
-            except:
-                continue
-        if not username_filled:
-            log("Failed to find username input", "WARN")
-        
-        # Try different selectors for password
-        password_selectors = ['input[name="password"]', 'input[type="password"]', 'input[placeholder*="password" i]', '#password']
-        password_filled = False
-        for sel in password_selectors:
-            try:
-                ele = page.ele(sel, timeout=2)
-                if ele:
-                    ele.input(password)
-                    log(f"Password filled using selector: {sel}")
-                    password_filled = True
-                    break
-            except:
-                continue
-        if not password_filled:
-            log("Failed to find password input", "WARN")
+        # Fill credentials using enhanced function
+        fill_login_form(page, email, password)
+            log("Failed to fill login form, trying JS injection...", "WARN")
+            # Fallback: use JS to fill
+            page.run_js(f"""
+                const inputs = document.querySelectorAll('input');
+                inputs.forEach(inp => {{
+                    if (inp.type === 'email' || inp.type === 'text') {{
+                        inp.value = '{email}';
+                        inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    }} else if (inp.type === 'password') {{
+                        inp.value = '{password}';
+                        inp.dispatchEvent(new Event('input', {{bubbles: true}}));
+                    }}
+                }});
+            """)
+            log("Tried JS injection fallback")
 
         # Click login
         log("Clicking login button...")
