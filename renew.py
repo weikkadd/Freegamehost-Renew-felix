@@ -24,7 +24,7 @@ except ImportError:
     sr = None
 
 PANEL_URL = "https://panel.freegamehost.xyz"
-MAX_CAPTCHA_ATTEMPTS = 3
+MAX_CAPTCHA_ATTEMPTS = 10
 SCREENSHOT_DIR = "output/screenshots"
 
 
@@ -394,19 +394,57 @@ def get_audio_url(page):
 
 
 def reload_challenge(page):
+    """Reload audio challenge. Returns True if audio URL changed after reload."""
     bframe = find_recaptcha_frame(page, "bframe")
     if not bframe:
-        return
+        log("reload_challenge: no bframe", "WARN")
+        return False
+
+    old_url = get_audio_url(page)
+
+    # Try clicking the reload button (native click first, JS click as fallback)
+    clicked = False
     try:
         reload_btn = bframe.ele('#recaptcha-reload-button', timeout=2)
         if reload_btn:
             try:
                 reload_btn.click()
-            except:
-                reload_btn.click(by_js=True)
-            time.sleep(3)
-    except:
+                clicked = True
+            except Exception:
+                try:
+                    reload_btn.click(by_js=True)
+                    clicked = True
+                except Exception:
+                    pass
+    except Exception:
         pass
+
+    # If native button click failed, force JS click directly on the element
+    if not clicked:
+        try:
+            bframe.run_js("document.querySelector('#recaptcha-reload-button')?.click();")
+            clicked = True
+        except Exception:
+            pass
+
+    if not clicked:
+        log("reload_challenge: reload button not found/clicked", "WARN")
+        return False
+
+    # Wait for the audio URL to change (max 8 seconds)
+    new_url = None
+    for _ in range(16):
+        time.sleep(0.5)
+        new_url = get_audio_url(page)
+        if new_url and new_url != old_url:
+            break
+    else:
+        log("reload_challenge: audio URL did not change after reload", "WARN")
+        return False
+
+    # Give Google a moment to fully load the new audio
+    time.sleep(random.uniform(0.5, 1.0))
+    return True
 
 
 def fill_and_verify(page, text):
@@ -461,22 +499,77 @@ def download_audio(url):
 
 
 def recognize_audio(mp3_path):
+    """Recognize audio captcha using multiple strategies for better accuracy."""
     if sr is None:
         return None
+    wav_path = mp3_path.replace(".mp3", ".wav")
     try:
-        wav_path = mp3_path.replace(".mp3", ".wav")
+        # Convert with explicit sample rate (reCAPTCHA audio is 48kHz mono)
         AudioSegment.from_mp3(mp3_path).export(wav_path, format="wav")
+    except Exception as e:
+        log(f"recognize_audio: MP3->WAV conversion failed: {e}", "ERROR")
+        return None
+
+    results = []
+    try:
         recognizer = sr.Recognizer()
-        with sr.AudioFile(wav_path) as src:
-            audio_data = recognizer.record(src)
-            text = recognizer.recognize_google(audio_data)
+        # Try multiple strategies to improve recognition accuracy
+        strategies = [
+            {"dynamic_energy": True, "adjust_duration": 0.5, "show_all": False},
+            {"dynamic_energy": False, "adjust_duration": 1.0, "show_all": False},
+            {"dynamic_energy": True, "adjust_duration": 0.2, "show_all": True},
+        ]
+        for strat in strategies:
+            try:
+                with sr.AudioFile(wav_path) as src:
+                    if strat["dynamic_energy"]:
+                        recognizer.dynamic_energy_threshold = True
+                        recognizer.adjust_for_ambient_noise(src, duration=strat["adjust_duration"])
+                    else:
+                        recognizer.dynamic_energy_threshold = False
+                        recognizer.energy_threshold = 300  # fixed threshold for quiet audio
+                    audio_data = recognizer.record(src)
+                    if strat["show_all"]:
+                        alternatives = recognizer.recognize_google(audio_data, show_all=True)
+                        if alternatives:
+                            # Pick the alternative with highest confidence
+                            best = None
+                            best_conf = 0
+                            for alt in alternatives.get('alternative', []):
+                                conf = alt.get('confidence', 0)
+                                if conf >= best_conf and alt.get('transcript'):
+                                    best = alt['transcript']
+                                    best_conf = conf
+                            if best:
+                                results.append((best, best_conf))
+                                continue
+                    else:
+                        text = recognizer.recognize_google(audio_data)
+                        if text:
+                            results.append((text, 0.5))
+                            continue
+            except sr.UnknownValueError:
+                continue
+            except sr.RequestError as e:
+                log(f"recognize_audio: Google API error: {e}", "WARN")
+                continue
+            except Exception as e:
+                log(f"recognize_audio: strategy error: {e}", "WARN")
+                continue
+    finally:
         try:
             os.remove(wav_path)
-        except:
+        except Exception:
             pass
-        return text
-    except:
+
+    if not results:
         return None
+    # Sort by confidence (descending) and return the best transcript
+    results.sort(key=lambda x: x[1], reverse=True)
+    # Normalize: lowercase, strip, collapse whitespace
+    best_text = ' '.join(results[0][0].lower().split())
+    log(f"recognize_audio: best of {len(results)} strategies: '{best_text}' (conf={results[0][1]:.2f})")
+    return best_text
 
 
 def solve_recaptcha(page):
@@ -528,7 +621,10 @@ def solve_recaptcha(page):
             log("bframe did not appear within 15s; proceeding to retry loop", "WARN")
 
     dl_fails = 0
+    last_text = None
+    same_text_streak = 0
     for i in range(MAX_CAPTCHA_ATTEMPTS):
+        log(f"--- Attempt {i+1}/{MAX_CAPTCHA_ATTEMPTS} ---")
         if is_recaptcha_solved(page):
             return True
         if is_blocked(page):
@@ -564,14 +660,19 @@ def solve_recaptcha(page):
 
         audio_url = get_audio_url(page)
         if not audio_url:
+            log("No audio URL found, reloading challenge")
             reload_challenge(page)
             continue
+        # Log audio URL (truncated & masked) for debugging
+        masked_url = audio_url[:60] + "..." if len(audio_url) > 60 else audio_url
+        log(f"Audio URL: {masked_url}")
 
         mp3 = download_audio(audio_url)
         if not mp3:
             dl_fails += 1
             if dl_fails >= 3:
                 raise RuntimeError("Audio download failed 3 times")
+            log("Audio download failed, reloading challenge", "WARN")
             reload_challenge(page)
             time.sleep(random.uniform(3, 6))
             continue
@@ -580,20 +681,49 @@ def solve_recaptcha(page):
         text = recognize_audio(mp3)
         try:
             os.remove(mp3)
-        except:
+        except Exception:
             pass
         if not text:
+            log("Recognition returned empty, reloading challenge", "WARN")
             reload_challenge(page)
             time.sleep(3)
             continue
 
         log(f"Recognition result: [{text}]")
+
+        # Detect if we're stuck on the same audio (Google returned identical result)
+        if text == last_text:
+            same_text_streak += 1
+            log(f"Same recognition result as last attempt (streak={same_text_streak})", "WARN")
+            if same_text_streak >= 2:
+                # Force hard reload: switch back to image mode briefly, then back to audio
+                # This is the most reliable way to get a fresh challenge when reload isn't working
+                log("Hard reset: switching challenge mode to force fresh audio", "WARN")
+                # Click the "Get an audio challenge" button again after reloading
+                try_invoke_grecaptcha_execute(page)
+                time.sleep(2)
+                reload_challenge(page)
+                last_text = None
+                same_text_streak = 0
+                continue
+        else:
+            same_text_streak = 0
+        last_text = text
+
         fill_and_verify(page, text)
         time.sleep(5)
         if is_recaptcha_solved(page):
             return True
-        reload_challenge(page)
-        time.sleep(random.uniform(2, 4))
+
+        # Reload and verify it actually changed the audio URL
+        if not reload_challenge(page):
+            log("Reload failed to change audio URL; sleeping before next attempt", "WARN")
+            time.sleep(random.uniform(3, 5))
+            # Last resort: re-trigger execute
+            try_invoke_grecaptcha_execute(page)
+            time.sleep(2)
+        else:
+            time.sleep(random.uniform(1.5, 3))
 
     raise RuntimeError("Max captcha attempts reached")
 
