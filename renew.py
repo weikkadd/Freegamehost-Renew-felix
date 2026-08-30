@@ -56,7 +56,15 @@ def mask_url(url):
 
 def get_server_name(page):
     try:
-        return (page.ele('#serverName', timeout=2) or page.ele('text:/服务器|server/i', timeout=2))?.text.strip() or "未知"
+        ele = page.ele('#serverName', timeout=2)
+        if ele:
+            return ele.text.strip()
+    except:
+        pass
+    try:
+        ele = page.ele('text:/服务器|server/i', timeout=2)
+        if ele:
+            return ele.text.strip()
     except:
         pass
     return "未知"
