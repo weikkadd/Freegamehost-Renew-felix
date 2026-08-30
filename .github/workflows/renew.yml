@@ -26,6 +26,7 @@ jobs:
         run: |
           if [ -z "$GOST_PROXY" ]; then
             echo "⏭️ 未配置代理"
+            echo "BROWSER_PROXY=" >> $GITHUB_ENV
             exit 0
           fi
           VERSION=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest \
@@ -36,15 +37,24 @@ jobs:
           chmod +x gost
           ./gost -V
           ./gost -L http://:8080 -F "$GOST_PROXY" -D > gost.log 2>&1 &
-          sleep 3
-          # 测试上游代理是否可用
+          GOST_PID=$!
+          echo "✅ GOST PID: $GOST_PID"
+          sleep 5
+          # 检查 Gost 是否还在运行
+          if ! kill -0 $GOST_PID 2>/dev/null; then
+            echo "❌ GOST 进程已退出！"
+            cat gost.log || true
+            echo "BROWSER_PROXY=" >> $GITHUB_ENV
+            exit 1
+          fi
+          # 测试上游代理
           echo "🔍 测试上游代理..."
-          RESULT=$(curl -s --max-time 10 -x http://127.0.0.1:8080 https://api.ipify.org 2>/dev/null)
-          if [ -n "$RESULT" ] && [ "$RESULT" != "" ]; then
+          RESULT=$(curl -s --max-time 15 -x http://127.0.0.1:8080 https://api.ipify.org 2>/dev/null || echo "")
+          if [ -n "$RESULT" ]; then
             echo "✅ 代理可用，出口IP: $RESULT"
             echo "BROWSER_PROXY=http://127.0.0.1:8080" >> $GITHUB_ENV
           else
-            echo "❌ 代理不可用（认证失败或超时），将使用直连模式"
+            echo "⚠️ 代理认证失败或超时，将使用直连模式"
             echo "BROWSER_PROXY=" >> $GITHUB_ENV
             cat gost.log || true
           fi
@@ -65,17 +75,18 @@ jobs:
 
       - name: 🔍 网络诊断
         run: |
-          echo "🌐 BROWSER_PROXY=$BROWSER_PROXY"
+          echo "🌐 BROWSER_PROXY=${BROWSER_PROXY:-无}"
           echo ""
-          echo "=== 直接访问测试 ==="
-          curl -s --max-time 15 https://panel.freegamehost.xyz -o /dev/null -w "HTTP %{http_code}, Time: %{time_total}s\n"
-          if [ -n "$BROWSER_PROXY" ]; then
-            echo "=== 代理访问测试 ==="
-            curl -s --max-time 15 -x "$BROWSER_PROXY" https://panel.freegamehost.xyz -o /dev/null -w "HTTP %{http_code}, Time: %{time_total}s\n"
+          echo "=== 直接访问 FreeGameHost ==="
+          curl -s --max-time 15 https://panel.freegamehost.xyz -o /dev/null -w "HTTP %{http_code}, Time: %{time_total}s\n" || echo "直接访问失败"
+          if [ -n "${BROWSER_PROXY:-}" ]; then
+            echo ""
+            echo "=== 通过 Gost 访问 ==="
+            curl -s --max-time 15 -x "$BROWSER_PROXY" https://panel.freegamehost.xyz -o /dev/null -w "HTTP %{http_code}, Time: %{time_total}s\n" || echo "代理访问失败"
           fi
           echo ""
-          echo "=== Gost 日志（如果有）==="
-          cat gost.log 2>/dev/null | tail -20 || echo "无 gost.log"
+          echo "=== Gost 日志（最后10行）==="
+          tail -10 gost.log 2>/dev/null || echo "无 gost.log"
 
       - name: 🚀 运行续期脚本
         env:
