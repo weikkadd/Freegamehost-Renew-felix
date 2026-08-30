@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-FreeGameHost.xyz 自动续期脚本
-使用 DrissionPage + reCAPTCHA 音频识别 自动解决验证�?环境变量:
-  FGH_ACCOUNT  �?必填，格�? email,password
-  TG_BOT_TOKEN �?Telegram Bot Token
-  TG_CHAT_ID   �?Telegram Chat ID
+FreeGameHost.xyz Auto Renew Script
+Uses DrissionPage + reCAPTCHA audio recognition
+Environment variables:
+  FGH_ACCOUNT  - required, format: email,password
+  TG_BOT_TOKEN - Telegram Bot Token
+  TG_CHAT_ID   - Telegram Chat ID
 """
 
 import os
@@ -22,7 +24,7 @@ try:
     import speech_recognition as sr
     from pydub import AudioSegment
 except ImportError:
-    print("[WARN] speech_recognition/pydub 未安装，音频验证码功能不可用")
+    print("[WARN] speech_recognition/pydub not installed, audio captcha unavailable")
     sr = None
 
 PANEL_URL = "https://panel.freegamehost.xyz"
@@ -36,19 +38,17 @@ def log(msg, level="INFO"):
 
 
 def send_tg(token, chat_id, text):
-    """发�?Telegram 通知"""
     try:
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         data = {"chat_id": chat_id, "text": text, "parse_mode": "HTML"}
         r = requests.post(url, data=data, timeout=30)
         r.raise_for_status()
-        log("Telegram 通知已发�?)
+        log("Telegram notification sent")
     except Exception as e:
-        log(f"Telegram 通知失败: {e}", "ERROR")
+        log(f"Telegram notification failed: {e}", "ERROR")
 
 
 def mask_url(url):
-    """隐藏 UUID，只保留域名"""
     import re
     return re.sub(r'(\?i=)([^&]{1})([^&]*)', r'\1\2***', url)
 
@@ -66,7 +66,7 @@ def get_server_name(page):
             return ele.text.strip()
     except:
         pass
-    return "未知"
+    return "Unknown"
 
 
 def get_expire_time(page):
@@ -78,11 +78,10 @@ def get_expire_time(page):
                 return ele.text.strip()
         except:
             continue
-    return "未知"
+    return "Unknown"
 
 
-# ── reCAPTCHA 相关函数 ──
-
+# reCAPTCHA functions
 def find_recaptcha_frame(page, kind):
     try:
         for frame in page.get_frames():
@@ -141,10 +140,10 @@ def click_recaptcha_checkbox(page):
                 break
             time.sleep(1)
     if not anchor:
-        raise RuntimeError("未找�?reCAPTCHA anchor frame")
+        raise RuntimeError("reCAPTCHA anchor frame not found")
     checkbox = anchor.ele('#recaptcha-anchor', timeout=3)
     if not checkbox:
-        raise RuntimeError("未找�?reCAPTCHA 复选框")
+        raise RuntimeError("reCAPTCHA checkbox not found")
     page.actions.move_to(checkbox, duration=random.uniform(0.4, 1.0))
     time.sleep(random.uniform(0.2, 0.5))
     try:
@@ -153,7 +152,7 @@ def click_recaptcha_checkbox(page):
         checkbox.click(by_js=True)
     time.sleep(3)
     if is_blocked(page):
-        raise Exception("IP �?Google reCAPTCHA 封锁")
+        raise Exception("IP blocked by Google reCAPTCHA")
 
 
 def switch_to_audio(page):
@@ -176,24 +175,24 @@ def switch_to_audio(page):
                     audio_btn.click(by_js=True)
                 time.sleep(3)
                 if is_blocked(page):
-                    raise Exception("IP 被封锁（点击音频按钮后）")
+                    raise Exception("IP blocked after clicking audio button")
                 input_box = bframe.ele('#audio-response', timeout=1)
                 if input_box and input_box.states.is_displayed:
                     return True
         except Exception as e:
-            if "封锁" in str(e) or "blocked" in str(e).lower():
+            if "blocked" in str(e).lower():
                 raise
             pass
         try:
             bframe.run_js("document.querySelector('#recaptcha-audio-button')?.click();")
             time.sleep(3)
             if is_blocked(page):
-                raise Exception("IP 被封锁（JS点击后）")
+                raise Exception("IP blocked after JS click")
             input_box = bframe.ele('#audio-response', timeout=1)
             if input_box and input_box.states.is_displayed:
                 return True
         except Exception as e:
-            if "封锁" in str(e) or "blocked" in str(e).lower():
+            if "blocked" in str(e).lower():
                 raise
             pass
         time.sleep(2)
@@ -331,14 +330,14 @@ def solve_recaptcha(page):
             break
         time.sleep(1)
     else:
-        raise RuntimeError("reCAPTCHA 加载超时")
+        raise RuntimeError("reCAPTCHA load timeout")
 
     dl_fails = 0
     for i in range(MAX_CAPTCHA_ATTEMPTS):
         if is_recaptcha_solved(page):
             return True
         if is_blocked(page):
-            raise Exception("IP �?Google reCAPTCHA 封锁")
+            raise Exception("IP blocked by Google reCAPTCHA")
 
         if i == 0:
             click_recaptcha_checkbox(page)
@@ -356,7 +355,7 @@ def solve_recaptcha(page):
             time.sleep(random.uniform(2, 4))
 
         if is_blocked(page):
-            raise Exception("音频模式检测到 IP 被封")
+            raise Exception("Audio mode detected IP blocked")
 
         audio_url = get_audio_url(page)
         if not audio_url:
@@ -367,7 +366,7 @@ def solve_recaptcha(page):
         if not mp3:
             dl_fails += 1
             if dl_fails >= 3:
-                raise RuntimeError("音频连续下载失败")
+                raise RuntimeError("Audio download failed 3 times")
             reload_challenge(page)
             time.sleep(random.uniform(3, 6))
             continue
@@ -383,7 +382,7 @@ def solve_recaptcha(page):
             time.sleep(3)
             continue
 
-        log(f"识别结果: [{text}]")
+        log(f"Recognition result: [{text}]")
         fill_and_verify(page, text)
         time.sleep(5)
         if is_recaptcha_solved(page):
@@ -391,7 +390,7 @@ def solve_recaptcha(page):
         reload_challenge(page)
         time.sleep(random.uniform(2, 4))
 
-    raise RuntimeError("验证码达到最大尝试次�?)
+    raise RuntimeError("Max captcha attempts reached")
 
 
 def capture_screenshot(page, filename):
@@ -400,27 +399,27 @@ def capture_screenshot(page, filename):
         page.get_screenshot(path=filename)
         return filename
     except Exception as e:
-        log(f"截图失败: {e}", "WARN")
+        log(f"Screenshot failed: {e}", "WARN")
         return None
 
 
 def main():
-    # ── 解析配置 ──
+    # Parse config
     account = os.environ.get("FGH_ACCOUNT", "").strip()
     if not account or "," not in account:
-        log("错误: FGH_ACCOUNT 未设置或格式不正确（应为 email,password�?, "ERROR")
+        log("ERROR: FGH_ACCOUNT not set or invalid format (should be email,password)", "ERROR")
         sys.exit(1)
 
     email, password = account.split(",", 1)
     email = email.strip()
     password = password.strip()
-    log(f"账号: {email}")
-    log(f"密码长度: {len(password)}")
+    log(f"Account: {email}")
+    log(f"Password length: {len(password)}")
 
     tg_token = os.environ.get("TG_BOT_TOKEN", "").strip()
     tg_chat_id = os.environ.get("TG_CHAT_ID", "").strip()
 
-    # ── 启动虚拟显示 ──
+    # Start virtual display
     vdisplay = Xvfb(width=1920, height=1080, colordepth=24)
     vdisplay.start()
 
@@ -428,7 +427,7 @@ def main():
     error_msg = ""
 
     try:
-        # ── 启动浏览�?──
+        # Launch browser
         co = ChromiumOptions()
         co.set_browser_path('/usr/bin/google-chrome')
         co.set_argument('--no-sandbox')
@@ -443,10 +442,9 @@ def main():
         co.set_argument('--log-level=3')
         co.headless(False)
 
-        # 启动浏览�?
         page = ChromiumPage(co)
 
-        # ── 反指�?──
+        # Anti-fingerprint
         page.run_js("""
             const getParameter = WebGLRenderingContext.prototype.getParameter;
             WebGLRenderingContext.prototype.getParameter = function(parameter) {
@@ -459,28 +457,28 @@ def main():
             Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
         """)
 
-        # ── 访问登录�?──
-        log("正在打开登录页面...")
+        # Access login page
+        log("Opening login page...")
         page.get(f"{PANEL_URL}/auth/login")
         time.sleep(8)
         page.get_screenshot(f"{SCREENSHOT_DIR}/01_login_page.png")
 
-        # ── 填入凭据 ──
-        log("正在填入登录信息...")
+        # Fill credentials
+        log("Filling login info...")
         try:
             page.ele('input[name="username"]').input(email)
-            log(f"已填入用户名: {email}")
+            log(f"Username filled: {email}")
         except Exception as e:
-            log(f"填入用户名失�? {e}", "WARN")
+            log(f"Failed to fill username: {e}", "WARN")
 
         try:
             page.ele('input[name="password"]').input(password)
-            log(f"已填入密�?(长度{len(password)})")
+            log(f"Password filled (length {len(password)})")
         except Exception as e:
-            log(f"填入密码失败: {e}", "WARN")
+            log(f"Failed to fill password: {e}", "WARN")
 
-        # ── 点击登录 ──
-        log("正在点击登录按钮...")
+        # Click login
+        log("Clicking login button...")
         try:
             page.ele('button[type="submit"]').click()
         except:
@@ -491,18 +489,18 @@ def main():
 
         time.sleep(10)
         current_url = page.url
-        log(f"登录后URL: {current_url}")
+        log(f"After login URL: {current_url}")
         page.get_screenshot(f"{SCREENSHOT_DIR}/02_after_login.png")
 
         if "login" in current_url.lower():
-            # 检查是否有 reCAPTCHA
+            # Check for reCAPTCHA
             if find_recaptcha_frame(page, "anchor"):
-                log("检测到 reCAPTCHA，开始破�?..")
+                log("reCAPTCHA detected, starting solve...")
                 try:
                     solve_recaptcha(page)
-                    log("reCAPTCHA 破解成功")
+                    log("reCAPTCHA solved")
                     time.sleep(3)
-                    # 重新点击登录
+                    # Re-click login
                     try:
                         page.ele('button[type="submit"]').click()
                     except:
@@ -510,43 +508,44 @@ def main():
                     time.sleep(10)
                     current_url = page.url
                 except Exception as e:
-                    error_msg = f"reCAPTCHA 破解失败: {e}"
-                    log(f"�?{error_msg}", "ERROR")
+                    error_msg = f"reCAPTCHA solve failed: {e}"
+                    log(f"ERROR: {error_msg}", "ERROR")
                     page.get_screenshot(f"{SCREENSHOT_DIR}/error_captcha.png")
                     raise
 
             if "login" in page.url.lower():
-                error_msg = "登录失败：请检查账号密码是否正�?
+                error_msg = "Login failed: check username/password"
                 page.get_screenshot(f"{SCREENSHOT_DIR}/error_login_failed.png")
                 raise Exception(error_msg)
 
-        log("�?登录成功�?)
+        log("Login successful!")
 
-        # ── 前往仪表�?──
-        log("正在打开仪表�?..")
+        # Go to dashboard
+        log("Opening dashboard...")
         page.get(f"{PANEL_URL}/")
         time.sleep(5)
         page.get_screenshot(f"{SCREENSHOT_DIR}/03_dashboard.png")
 
-        # ── 查找续期链接 ──
+        # Find renewal links
         server_links = page.eles('a[href*="/server/renew"]')
         if not server_links:
             server_links = page.eles('a[href*="/server/"]')
 
         if server_links:
-            log(f"发现 {len(server_links)} 个服务器，开始逐个续期...")
+            log(f"Found {len(server_links)} servers, starting renew...")
             for i, link in enumerate(server_links):
                 try:
                     href = link.attr('href')
-                    log(f"进入服务�?{i+1}: {mask_url(PANEL_URL + href if not href.startswith('http') else href)}")
-                    page.get(href if href.startswith('http') else f"{PANEL_URL}{href}")
+                    url = href if href.startswith('http') else f"{PANEL_URL}{href}"
+                    log(f"Server {i+1}: {mask_url(url)}")
+                    page.get(url)
                     time.sleep(5)
                     page.get_screenshot(f"{SCREENSHOT_DIR}/server_{i+1}_page.png")
 
                     old_expire = get_expire_time(page)
-                    log(f"服务�?{i+1} 到期时间: {old_expire}")
+                    log(f"Server {i+1} expires: {old_expire}")
 
-                    # 点击 Renew 按钮
+                    # Click Renew button
                     renew_btn = None
                     try:
                         renew_btn = page.ele('xpath://button[contains(text(), "Renew server")]', timeout=3)
@@ -569,26 +568,25 @@ def main():
                             renew_btn.click()
                         except:
                             renew_btn.click(by_js=True)
-                        log(f"服务�?{i+1} 已点击续期按�?)
+                        log(f"Server {i+1} clicked renew")
                     else:
-                        log(f"服务�?{i+1} 未找到续期按�?, "WARN")
+                        log(f"Server {i+1} no renew button found", "WARN")
                         continue
 
-                    # 等待弹窗
                     time.sleep(5)
 
-                    # 检查是否有 reCAPTCHA
+                    # Check reCAPTCHA
                     if find_recaptcha_frame(page, "anchor"):
-                        log(f"服务�?{i+1} 检测到 reCAPTCHA，开始破�?..")
+                        log(f"Server {i+1} reCAPTCHA detected")
                         try:
                             solve_recaptcha(page)
-                            log(f"服务�?{i+1} reCAPTCHA 破解成功")
+                            log(f"Server {i+1} reCAPTCHA solved")
                             time.sleep(3)
                         except Exception as e:
-                            log(f"服务�?{i+1} reCAPTCHA 破解失败: {e}", "ERROR")
+                            log(f"Server {i+1} reCAPTCHA failed: {e}", "ERROR")
                             continue
 
-                    # 确认续期
+                    # Confirm renew
                     confirm_btn = None
                     try:
                         confirm_btn = page.ele('xpath://button[normalize-space(text())="Renew"]', timeout=5)
@@ -599,28 +597,27 @@ def main():
                             confirm_btn.click()
                         except:
                             confirm_btn.click(by_js=True)
-                        log(f"服务�?{i+1} 已确认续�?)
+                        log(f"Server {i+1} confirmed renew")
                     else:
-                        log(f"服务�?{i+1} 未找到确认按�?, "WARN")
+                        log(f"Server {i+1} no confirm button found", "WARN")
                         continue
 
                     time.sleep(10)
                     new_expire = get_expire_time(page)
                     page.get_screenshot(f"{SCREENSHOT_DIR}/server_{i+1}_result.png")
 
-                    if new_expire != old_expire and new_expire != "未知":
-                        log(f"�?服务�?{i+1} 续期成功: {old_expire} -> {new_expire}")
+                    if new_expire != old_expire and new_expire != "Unknown":
+                        log(f"Server {i+1} renewed: {old_expire} -> {new_expire}")
                         success = True
                     else:
-                        log(f"⚠️ 服务�?{i+1} 可能已续期或状态未更新", "WARN")
+                        log(f"Server {i+1} may already renewed", "WARN")
                         success = True
 
                 except Exception as e:
-                    log(f"服务�?{i+1} 续期失败: {e}", "ERROR")
+                    log(f"Server {i+1} renew failed: {e}", "ERROR")
                     page.get_screenshot(f"{SCREENSHOT_DIR}/server_{i+1}_error.png")
         else:
-            log("⚠️ 未找到服务器续期链接，尝试点击页面续期按�?..", "WARN")
-            # 尝试其他方式
+            log("No server renewal links found, trying buttons...", "WARN")
             renew_buttons = page.eles('button')
             found_renew = False
             for btn in renew_buttons:
@@ -628,7 +625,7 @@ def main():
                     try:
                         btn.click()
                         found_renew = True
-                        log("已点�?Renew 按钮")
+                        log("Clicked Renew button")
                         break
                     except:
                         pass
@@ -639,7 +636,7 @@ def main():
 
     except Exception as e:
         error_msg = str(e)
-        log(f"�?出错: {error_msg}", "ERROR")
+        log(f"ERROR: {error_msg}", "ERROR")
         try:
             page.get_screenshot(f"{SCREENSHOT_DIR}/error_exception.png")
         except:
@@ -652,19 +649,19 @@ def main():
             pass
         vdisplay.stop()
 
-    # ── Telegram 通知 ──
+    # Telegram notification
     if tg_token and tg_chat_id:
         if success:
-            msg = "�?<b>FreeGameHost 续期成功</b>\n请查看截图确认�?
+            msg = "SUCCESS: FreeGameHost renewed!\nCheck screenshots for details."
         else:
-            msg = f"�?<b>FreeGameHost 续期失败</b>\n错误: {error_msg[:200]}"
+            msg = f"FAILED: FreeGameHost renewal failed\nError: {error_msg[:200]}"
         send_tg(tg_token, tg_chat_id, msg)
 
     if success:
-        log("完成�?)
+        log("Done!")
         sys.exit(0)
     else:
-        log(f"失败: {error_msg}")
+        log(f"Failed: {error_msg}")
         sys.exit(1)
 
 
