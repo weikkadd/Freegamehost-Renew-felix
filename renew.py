@@ -460,22 +460,55 @@ def main():
         # Access login page
         log("Opening login page...")
         page.get(f"{PANEL_URL}/auth/login")
-        time.sleep(8)
+        time.sleep(15)  # Wait for SPA to fully render
         page.get_screenshot(f"{SCREENSHOT_DIR}/01_login_page.png")
+        
+        # Check if page loaded correctly
+        current_url = page.url
+        page_text = page.html[:2000] if page.html else ""
+        log(f"Current URL: {current_url}")
+        
+        # If stuck on Cloudflare challenge, wait more
+        if "cloudflare" in current_url.lower() or "attention required" in page_text.lower():
+            log("Cloudflare challenge detected, waiting...", "WARN")
+            time.sleep(10)
+            page.get(f"{PANEL_URL}/auth/login")
+            time.sleep(15)
 
-        # Fill credentials
+        # Fill credentials with multiple selector attempts
         log("Filling login info...")
-        try:
-            page.ele('input[name="username"]').input(email)
-            log(f"Username filled: {email}")
-        except Exception as e:
-            log(f"Failed to fill username: {e}", "WARN")
-
-        try:
-            page.ele('input[name="password"]').input(password)
-            log(f"Password filled (length {len(password)})")
-        except Exception as e:
-            log(f"Failed to fill password: {e}", "WARN")
+        
+        # Try different selectors for username
+        username_selectors = ['input[name="username"]', 'input[type="email"]', 'input[placeholder*="email" i]', '#username']
+        username_filled = False
+        for sel in username_selectors:
+            try:
+                ele = page.ele(sel, timeout=2)
+                if ele:
+                    ele.input(email)
+                    log(f"Username filled using selector: {sel}")
+                    username_filled = True
+                    break
+            except:
+                continue
+        if not username_filled:
+            log("Failed to find username input", "WARN")
+        
+        # Try different selectors for password
+        password_selectors = ['input[name="password"]', 'input[type="password"]', 'input[placeholder*="password" i]', '#password']
+        password_filled = False
+        for sel in password_selectors:
+            try:
+                ele = page.ele(sel, timeout=2)
+                if ele:
+                    ele.input(password)
+                    log(f"Password filled using selector: {sel}")
+                    password_filled = True
+                    break
+            except:
+                continue
+        if not password_filled:
+            log("Failed to find password input", "WARN")
 
         # Click login
         log("Clicking login button...")
