@@ -457,7 +457,7 @@ def reload_challenge(page):
     # We must wait for the button to become enabled before clicking.
     log("reload_challenge: waiting for reload button to be enabled...")
     btn_ready = False
-    while time.time() - func_start < 8:  # max 8s wait
+    while time.time() - func_start < 20:  # max 20s wait (答案错误后 Google 冷却可能超过 8s)
         try:
             state = bframe.run_js("""
                 const btn = document.querySelector('#recaptcha-reload-button');
@@ -482,7 +482,7 @@ def reload_challenge(page):
         time.sleep(0.3)
     
     if not btn_ready:
-        log(f"reload_challenge: reload button still disabled after 8s, trying anyway", "WARN")
+        log(f"reload_challenge: reload button still disabled after 20s, trying anyway", "WARN")
     
     # Diagnostic: dump bframe HTML structure to find the actual reload button
     try:
@@ -706,7 +706,7 @@ def fill_and_verify(page, text):
     # 尤其是在只有一个代理节点时, 误报触发轮换也换不到新 IP)。
     log("fill_and_verify: waiting for Google to process verify response...")
     start = time.time()
-    while time.time() - start < 20:
+    while time.time() - start < 30:
         # Best case: solved
         if is_recaptcha_solved(page):
             log(f"fill_and_verify: ✓ reCAPTCHA solved after {time.time()-start:.1f}s")
@@ -868,12 +868,30 @@ def recognize_audio(mp3_path):
 
     if not results:
         return None
-    # Sort by confidence (descending) and return the best transcript
-    results.sort(key=lambda x: x[1], reverse=True)
-    # Normalize: lowercase, strip, collapse whitespace
-    best_text = ' '.join(results[0][0].lower().split())
-    log(f"recognize_audio: best of {len(results)} strategies: '{best_text}' (conf={results[0][1]:.2f})")
-    return best_text
+    # 多策略投票: 同一文本被越多策略识别出一致结果就越可信。
+    # 实测日志显示 3/4 策略一致的文本通常正确, 而"只看最高 confidence"反而
+    # 会选到个别含拼写错误的结果(如 Kompany itself has / situation and be cut)。
+    from collections import Counter
+
+    def norm(s):
+        return ' '.join(s.lower().split())
+
+    counter = Counter()
+    conf_sum = {}
+    for text, conf in results:
+        n = norm(text)
+        if not n:
+            continue
+        counter[n] += 1
+        conf_sum[n] = conf_sum.get(n, 0) + (conf if conf else 0.5)
+
+    if not counter:
+        return None
+    # 出现次数优先, 次数相同取 confidence 总和更高者
+    best_key = max(counter, key=lambda k: (counter[k], conf_sum[k]))
+    log(f"recognize_audio: voted {len(results)} results → '{best_key}' "
+        f"(votes={counter[best_key]}, conf_sum={conf_sum[best_key]:.2f})")
+    return best_key
 
 
 def solve_recaptcha(page):
