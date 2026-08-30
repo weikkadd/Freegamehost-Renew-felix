@@ -21,10 +21,13 @@ jobs:
           python-version: '3.x'
 
       - name: 🛡️ 启动 GOST 代理转发
-        if: ${{ secrets.GOST_PROXY != '' }}
         env:
           GOST_PROXY: ${{ secrets.GOST_PROXY }}
         run: |
+          if [ -z "$GOST_PROXY" ]; then
+            echo "⏭️ 未配置代理，跳过 GOST"
+            exit 0
+          fi
           VERSION=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest \
             | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
           echo "📦 GOST 版本: $VERSION"
