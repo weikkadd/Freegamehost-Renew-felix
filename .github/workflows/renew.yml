@@ -25,7 +25,7 @@ jobs:
           GOST_PROXY: ${{ secrets.GOST_PROXY }}
         run: |
           if [ -z "$GOST_PROXY" ]; then
-            echo "⏭️ 未配置代理，跳过 GOST"
+            echo "⏭️ 未配置代理"
             exit 0
           fi
           VERSION=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest \
@@ -35,25 +35,19 @@ jobs:
           tar -xzf "gost_${VERSION}_linux_amd64.tar.gz"
           chmod +x gost
           ./gost -V
-          # 启动 Gost 并立即查看错误
           ./gost -L http://:8080 -F "$GOST_PROXY" -D > gost.log 2>&1 &
-          GOST_PID=$!
-          echo "✅ GOST PID: $GOST_PID"
           sleep 3
-          # 检查是否崩溃
-          if ! kill -0 $GOST_PID 2>/dev/null; then
-            echo "❌ GOST 立即退出！日志："
-            cat gost.log
-            exit 1
+          # 测试上游代理是否可用
+          echo "🔍 测试上游代理..."
+          RESULT=$(curl -s --max-time 10 -x http://127.0.0.1:8080 https://api.ipify.org 2>/dev/null)
+          if [ -n "$RESULT" ] && [ "$RESULT" != "" ]; then
+            echo "✅ 代理可用，出口IP: $RESULT"
+            echo "BROWSER_PROXY=http://127.0.0.1:8080" >> $GITHUB_ENV
+          else
+            echo "❌ 代理不可用（认证失败或超时），将使用直连模式"
+            echo "BROWSER_PROXY=" >> $GITHUB_ENV
+            cat gost.log || true
           fi
-          # 测试通过 Gost 访问
-          echo "🔍 测试 Gost 连通性..."
-          curl -v -x http://127.0.0.1:8080 https://www.google.com --max-time 15 2>&1 | head -30
-          echo ""
-          echo "🌐 出口 IP: $(curl -s -x http://127.0.0.1:8080 https://api.ipify.org --max-time 15 || echo '获取失败')"
-          echo ""
-          echo "📋 Gost 日志："
-          cat gost.log
 
       - name: 🛠️ 安装系统依赖
         run: |
@@ -71,43 +65,36 @@ jobs:
 
       - name: 🔍 网络诊断
         run: |
-          echo "=== 进程检查 ==="
-          ps aux | grep -E "(gost|python)" | grep -v grep
+          echo "🌐 BROWSER_PROXY=$BROWSER_PROXY"
           echo ""
-          echo "=== 端口监听 ==="
-          ss -tlnp | grep -E "(8080|chrome)" || netstat -tlnp 2>/dev/null | grep -E "(8080|chrome)"
+          echo "=== 直接访问测试 ==="
+          curl -s --max-time 15 https://panel.freegamehost.xyz -o /dev/null -w "HTTP %{http_code}, Time: %{time_total}s\n"
+          if [ -n "$BROWSER_PROXY" ]; then
+            echo "=== 代理访问测试 ==="
+            curl -s --max-time 15 -x "$BROWSER_PROXY" https://panel.freegamehost.xyz -o /dev/null -w "HTTP %{http_code}, Time: %{time_total}s\n"
+          fi
           echo ""
-          echo "=== 直接访问 FreeGameHost（无代理）==="
-          curl -s --max-time 10 https://panel.freegamehost.xyz -o /dev/null -w "HTTP %{http_code}, Time: %{time_total}s\n" || echo "直接访问失败"
-          echo ""
-          echo "=== 通过 Gost 访问 FreeGameHost ==="
-          curl -s --max-time 15 -x http://127.0.0.1:8080 https://panel.freegamehost.xyz -o /dev/null -w "HTTP %{http_code}, Time: %{time_total}s\n" || echo "代理访问失败"
-          echo ""
-          echo "=== Gost 完整日志 ==="
-          cat gost.log
+          echo "=== Gost 日志（如果有）==="
+          cat gost.log 2>/dev/null | tail -20 || echo "无 gost.log"
 
       - name: 🚀 运行续期脚本
         env:
           PYTHONIOENCODING: utf-8
-          BROWSER_PROXY: http://127.0.0.1:8080
+          BROWSER_PROXY: ${{ env.BROWSER_PROXY }}
           FGH_ACCOUNT: ${{ secrets.FGH_ACCOUNT }}
           GOST_PROXY: ${{ secrets.GOST_PROXY }}
           TG_BOT: ${{ secrets.TG_BOT }}
         run: |
-          echo "=== 运行前状态 ==="
-          ps aux | grep gost | grep -v grep || echo "⚠️ GOST 未运行！"
-          echo ""
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
-          echo "脚本退出码: $?"
 
       - name: 📋 收集失败日志
         if: failure()
         run: |
-          echo "=== Gost 日志（完整）==="
+          echo "=== Gost 完整日志 ==="
           cat gost.log 2>/dev/null || echo "无 gost.log"
           echo ""
-          echo "=== 最后 50 行系统日志 ==="
-          journalctl -n 50 --no-pager 2>/dev/null || dmesg | tail -50 || echo "无法获取系统日志"
+          echo "=== 进程状态 ==="
+          ps aux | grep -E "(gost|python)" | grep -v grep || true
 
       - name: 📸 上传截图
         if: always()

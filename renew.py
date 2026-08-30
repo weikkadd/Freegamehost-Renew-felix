@@ -4,8 +4,8 @@ FreeGameHost.xyz 自动续期脚本
 使用 SeleniumBase 模拟浏览器登录并点击 Renew 按钮。
 环境变量:
   FGH_ACCOUNT  — 必填，格式: email,password
-  BROWSER_PROXY — 可选，浏览器直接使用的代理（如 http://127.0.0.1:8080）
-  GOST_PROXY   — 可选，上游代理（socks5://... 或 ip:port#label），当 BROWSER_PROXY 未设置时使用
+  BROWSER_PROXY — 可选，浏览器使用的代理（如 http://127.0.0.1:8080）
+  GOST_PROXY   — 可选，上游代理（当 BROWSER_PROXY 未设置时使用）
   TG_BOT       — 可选，格式: chat_id,bot_token
 """
 
@@ -53,7 +53,6 @@ def clean_proxy(proxy_str):
     """清理代理字符串，去除 #label 后缀"""
     if not proxy_str:
         return None
-    # 去除形如 #AU-Microsoft_Azure 的后缀
     clean = proxy_str.split('#')[0].strip()
     return clean if clean else None
 
@@ -75,7 +74,6 @@ def main():
         tg_chat_id, tg_bot_token = tg[0], tg[1]
 
     # ── 代理设置 ──
-    # 优先使用 BROWSER_PROXY（本地 Gost 代理），否则使用清理后的 GOST_PROXY
     browser_proxy = os.environ.get("BROWSER_PROXY", "").strip() or None
     raw_gost = os.environ.get("GOST_PROXY", "").strip() or None
     gost_proxy = clean_proxy(raw_gost) if raw_gost else None
@@ -83,6 +81,8 @@ def main():
     proxy_arg = browser_proxy or gost_proxy
     if proxy_arg:
         log(f"使用代理: {proxy_arg}")
+    else:
+        log("⚠️ 未配置代理，使用直连模式")
 
     # ── 启动浏览器 ──
     sb_kwargs = dict(
