@@ -35,19 +35,25 @@ jobs:
           tar -xzf "gost_${VERSION}_linux_amd64.tar.gz"
           chmod +x gost
           ./gost -V
-          nohup ./gost -L http://:8080 -F "$GOST_PROXY" > gost.log 2>&1 &
+          # 启动 Gost 并立即查看错误
+          ./gost -L http://:8080 -F "$GOST_PROXY" -D > gost.log 2>&1 &
           GOST_PID=$!
           echo "✅ GOST PID: $GOST_PID"
-          sleep 5
-          # 检查 Gost 是否仍在运行
+          sleep 3
+          # 检查是否崩溃
           if ! kill -0 $GOST_PID 2>/dev/null; then
-            echo "❌ GOST 进程已退出，查看日志："
+            echo "❌ GOST 立即退出！日志："
             cat gost.log
             exit 1
           fi
-          echo "✅ GOST 正在运行，测试连通性..."
-          curl -sv -x http://127.0.0.1:8080 https://api.ipify.org 2>&1 | tail -20
-          echo "🌐 出口IP: $(curl -s -x http://127.0.0.1:8080 https://api.ipify.org 2>/dev/null || echo '无法获取')"
+          # 测试通过 Gost 访问
+          echo "🔍 测试 Gost 连通性..."
+          curl -v -x http://127.0.0.1:8080 https://www.google.com --max-time 15 2>&1 | head -30
+          echo ""
+          echo "🌐 出口 IP: $(curl -s -x http://127.0.0.1:8080 https://api.ipify.org --max-time 15 || echo '获取失败')"
+          echo ""
+          echo "📋 Gost 日志："
+          cat gost.log
 
       - name: 🛠️ 安装系统依赖
         run: |
@@ -63,19 +69,22 @@ jobs:
           pip install seleniumbase
           seleniumbase install chromedriver
 
-      - name: 🔍 调试网络信息
+      - name: 🔍 网络诊断
         run: |
-          echo "=== GOST 进程 ==="
-          ps aux | grep gost | grep -v grep || echo "GOST 未运行！"
+          echo "=== 进程检查 ==="
+          ps aux | grep -E "(gost|python)" | grep -v grep
           echo ""
           echo "=== 端口监听 ==="
-          netstat -tlnp 2>/dev/null | grep 8080 || ss -tlnp | grep 8080 || echo "8080 端口未监听"
+          ss -tlnp | grep -E "(8080|chrome)" || netstat -tlnp 2>/dev/null | grep -E "(8080|chrome)"
           echo ""
-          echo "=== GOST 日志（最后20行）==="
-          tail -20 gost.log 2>/dev/null || echo "无 gost.log"
+          echo "=== 直接访问 FreeGameHost（无代理）==="
+          curl -s --max-time 10 https://panel.freegamehost.xyz -o /dev/null -w "HTTP %{http_code}, Time: %{time_total}s\n" || echo "直接访问失败"
           echo ""
-          echo "=== 直接访问测试 ==="
-          curl -s --max-time 10 https://panel.freegamehost.xyz -o /dev/null -w "HTTP %{http_code}\n" || echo "直接访问失败"
+          echo "=== 通过 Gost 访问 FreeGameHost ==="
+          curl -s --max-time 15 -x http://127.0.0.1:8080 https://panel.freegamehost.xyz -o /dev/null -w "HTTP %{http_code}, Time: %{time_total}s\n" || echo "代理访问失败"
+          echo ""
+          echo "=== Gost 完整日志 ==="
+          cat gost.log
 
       - name: 🚀 运行续期脚本
         env:
@@ -85,20 +94,20 @@ jobs:
           GOST_PROXY: ${{ secrets.GOST_PROXY }}
           TG_BOT: ${{ secrets.TG_BOT }}
         run: |
-          echo "=== 运行前检查 ==="
-          ps aux | grep gost | grep -v grep || echo "⚠️ GOST 未在运行！"
+          echo "=== 运行前状态 ==="
+          ps aux | grep gost | grep -v grep || echo "⚠️ GOST 未运行！"
           echo ""
           xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python renew.py
           echo "脚本退出码: $?"
 
-      - name: 📋 收集 GOST 日志
-        if: always()
+      - name: 📋 收集失败日志
+        if: failure()
         run: |
-          echo "=== GOST 完整日志 ==="
+          echo "=== Gost 日志（完整）==="
           cat gost.log 2>/dev/null || echo "无 gost.log"
           echo ""
-          echo "=== 网络状态 ==="
-          netstat -tlnp 2>/dev/null | head -20 || ss -tlnp | head -20
+          echo "=== 最后 50 行系统日志 ==="
+          journalctl -n 50 --no-pager 2>/dev/null || dmesg | tail -50 || echo "无法获取系统日志"
 
       - name: 📸 上传截图
         if: always()
