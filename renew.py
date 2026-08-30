@@ -159,9 +159,13 @@ def debug_page(page):
     
     # Get page text
     try:
-        text = page.get_text()
-        log(f"Page text length: {len(text)}")
-        log(f"Page text preview: {text[:300]}")
+        text = page.html
+        # Extract visible text from HTML
+        import re
+        visible = re.sub(r'<[^>]+>', ' ', text)
+        visible = re.sub(r'\s+', ' ', visible).strip()
+        log(f"Page text length: {len(visible)}")
+        log(f"Page text preview: {visible[:300]}")
     except:
         pass
     
@@ -588,8 +592,7 @@ def main():
         debug_page(page)
         
         # If stuck on Cloudflare challenge, wait more
-        page_text = page.get_text()
-        if "cloudflare" in current_url.lower() or "attention required" in page_text.lower():
+        if "cloudflare" in current_url.lower() or "attention required" in page.html[:2000].lower():
             log("Cloudflare challenge detected, waiting...", "WARN")
             time.sleep(10)
             page.get(f"{PANEL_URL}/auth/login")
