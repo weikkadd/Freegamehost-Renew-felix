@@ -1052,8 +1052,13 @@ def rotate_warp_ip():
     
     Returns True if rotation succeeded AND new IP differs from previous, False otherwise.
     Used to escape Google reCAPTCHA's IP-based blocking.
+    
+    Critical: --accept-tos must come BEFORE the subcommand (verified from fscarmen's action):
+        sudo warp-cli --accept-tos registration new    ← correct
+        warp-cli disconnect --accept-tos                ← WRONG (gives Usage error)
     """
     import subprocess
+    import shutil
     
     # Get current IP first
     try:
@@ -1064,61 +1069,62 @@ def rotate_warp_ip():
         old_ip = None
         log("Rotating WARP IP... (could not get current IP)")
     
-    # Different warp-cli versions and setups accept TOS differently. Try multiple approaches.
-    # The error message we saw was: 'Please accept the WARP Terms of Service...'
-    # Possible solutions:
-    #   - sudo warp-cli (TOS may have been accepted by root during setup)
-    #   - WARP_CLI_ACCEPT_TOS=1 env var
-    #   - --accept-tos flag (some versions)
-    #   - just call without flag (some versions have TOS pre-accepted)
+    # Find warp-cli binary (might not be in PATH for non-root users)
+    warp_cli_path = shutil.which('warp-cli') or '/usr/local/bin/warp-cli'
+    log(f"  warp-cli path: {warp_cli_path}")
     
-    def run_warp_cmd(args):
-        """Try warp-cli with multiple TOS-accept strategies. Returns combined stdout+stderr.
-        
-        Critical: --accept-tos must come BEFORE the subcommand (verified from fscarmen's action):
-            sudo warp-cli --accept-tos registration new    ← correct
-            warp-cli disconnect --accept-tos                ← WRONG (gives Usage error)
-        """
+    def run_warp_cmd(subcmd):
+        """Run warp-cli <subcmd> with multiple TOS-accept strategies.
+        Returns combined stdout+stderr (empty string if all variants failed)."""
         env = os.environ.copy()
         env['WARP_CLI_ACCEPT_TOS'] = '1'
         # Each variant uses CORRECT --accept-tos position (before subcommand)
-        # Different invocation styles in case sudo is needed or not
-        for variant in [
-            ['sudo', 'warp-cli', '--accept-tos'] + args[2:],   # sudo + flag (correct syntax)
-            ['warp-cli', '--accept-tos'] + args[2:],           # plain + flag (correct syntax)
-            ['sudo'] + args,                                    # sudo without flag (root TOS pre-accepted)
-            args,                                               # plain (in case TOS already accepted)
-        ]:
+        variants = [
+            ['sudo', warp_cli_path, '--accept-tos', subcmd],
+            [warp_cli_path, '--accept-tos', subcmd],
+            ['sudo', warp_cli_path, subcmd],
+            [warp_cli_path, subcmd],
+        ]
+        for i, variant in enumerate(variants):
             try:
+                log(f"    trying variant {i+1}: {' '.join(variant)}")
                 result = subprocess.run(
                     variant, env=env, capture_output=True, text=True, timeout=15
                 )
-                output = (result.stdout or '') + (result.stderr or '')
+                output = ((result.stdout or '') + (result.stderr or '')).strip()
+                if output:
+                    log(f"    output: {output[:200]}")
                 # Detect TOS-not-accepted error
                 if 'Terms of Service' in output and 'accept-tos' in output:
-                    continue  # try next variant
+                    log(f"    variant {i+1} hit TOS error, trying next", "WARN")
+                    continue
                 # Detect 'Usage' error (invalid flag)
                 if 'Usage:' in output and 'try \'--help\'' in output:
-                    continue  # try next variant
-                # Got some output (success or other error)
+                    log(f"    variant {i+1} hit Usage error, trying next", "WARN")
+                    continue
+                # Got some output (success or other error) — return it
+                log(f"    variant {i+1} accepted")
                 return output
-            except Exception as e:
-                log(f"  cmd variant {variant} failed: {e}", "WARN")
+            except subprocess.TimeoutExpired:
+                log(f"    variant {i+1} timed out", "WARN")
                 continue
+            except FileNotFoundError as e:
+                log(f"    variant {i+1} FileNotFoundError: {e}", "WARN")
+                continue
+            except Exception as e:
+                log(f"    variant {i+1} exception: {type(e).__name__}: {e}", "WARN")
+                continue
+        log(f"    all 4 variants failed for '{subcmd}'", "WARN")
         return ""
     
     # Try rotation up to 3 times until IP actually changes
     for attempt in range(3):
         try:
             log(f"  attempt {attempt+1}/3: disconnecting WARP...")
-            out = run_warp_cmd(['warp-cli', 'disconnect'])
-            if out:
-                log(f"  disconnect output: {out.strip()[:200]}")
+            run_warp_cmd('disconnect')
             time.sleep(3)
             log(f"  attempt {attempt+1}/3: reconnecting WARP...")
-            out = run_warp_cmd(['warp-cli', 'connect'])
-            if out:
-                log(f"  connect output: {out.strip()[:200]}")
+            run_warp_cmd('connect')
             time.sleep(5)
             # Verify new IP
             try:
@@ -1131,7 +1137,6 @@ def rotate_warp_ip():
                     log(f"  IP unchanged ({new_ip}), will retry rotation", "WARN")
             except Exception as e:
                 log(f"  failed to verify new IP: {e}", "WARN")
-                # Can't verify, assume it changed
                 return True
         except Exception as e:
             log(f"  WARP rotation attempt {attempt+1} failed: {e}", "WARN")
