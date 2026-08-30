@@ -4,9 +4,8 @@ FreeGameHost.xyz 自动续期脚本
 使用 SeleniumBase 模拟浏览器登录并点击 Renew 按钮。
 环境变量:
   FGH_ACCOUNT  — 必填，格式: email,password
-  BROWSER_PROXY — 可选，浏览器使用的代理（如 http://127.0.0.1:8080）
-                  设为空字符串表示不使用代理
-  GOST_PROXY   — 可选，上游代理（当 BROWSER_PROXY 未设置且非空时使用）
+  BROWSER_PROXY — 可选，浏览器使用的代理
+  GOST_PROXY   — 可选，上游代理
   TG_BOT       — 可选，格式: chat_id,bot_token
 """
 
@@ -65,8 +64,10 @@ def main():
         log("错误: FGH_ACCOUNT 未设置或格式不正确（应为 email,password）")
         sys.exit(1)
 
-    email, password = account[0], account[1]
+    email = account[0]
+    password = account[1]
     log(f"账号: {email}")
+    log(f"密码长度: {len(password)}")
 
     # ── 解析 Telegram ──
     tg = parse_env("TG_BOT")
@@ -75,20 +76,14 @@ def main():
         tg_chat_id, tg_bot_token = tg[0], tg[1]
 
     # ── 代理设置 ──
-    # BROWSER_PROXY 显式控制是否使用代理：
-    # - 有值 → 使用该代理
-    # - 空字符串 → 不使用代理（直连）
-    # - 未设置 → 回退到 GOST_PROXY
     browser_proxy_env = os.environ.get("BROWSER_PROXY", None)
     if browser_proxy_env is not None and browser_proxy_env.strip() == "":
-        # 显式设置为空，不使用代理
         proxy_arg = None
         log("⚠️ BROWSER_PROXY 已设为空，使用直连模式")
     elif browser_proxy_env:
         proxy_arg = browser_proxy_env.strip()
         log(f"使用代理: {proxy_arg}")
     else:
-        # 回退到 GOST_PROXY
         raw_gost = os.environ.get("GOST_PROXY", "").strip() or None
         proxy_arg = clean_proxy(raw_gost) if raw_gost else None
         if proxy_arg:
@@ -113,42 +108,77 @@ def main():
             # ── 第一步：登录 ──
             log("正在打开登录页面...")
             sb.open(f"{PANEL_URL}/auth/login")
-            time.sleep(3)
+            time.sleep(5)
 
             # 截图用于调试
             sb.save_screenshot("01_login_page.png")
+            log(f"当前URL: {sb.get_current_url()}")
 
-            # 检查是否已在登录页
-            if not sb.is_element_present('input[name="username"]'):
-                # Pterodactyl 有时用 email 字段
-                if sb.is_element_present('input[name="email"]'):
+            # 打印页面上所有输入框和按钮信息
+            log("=== 页面元素诊断 ===")
+            all_inputs = sb.find_elements("input")
+            log(f"找到 {len(all_inputs)} 个 input 元素:")
+            for i, inp in enumerate(all_inputs):
+                try:
+                    name = inp.get_attribute("name")
+                    id_attr = inp.get_attribute("id")
+                    type_attr = inp.get_attribute("type")
+                    placeholder = inp.get_attribute("placeholder")
+                    log(f"  [{i}] name={name}, id={id_attr}, type={type_attr}, placeholder={placeholder}")
+                except Exception:
+                    pass
+
+            all_buttons = sb.find_elements("button")
+            log(f"找到 {len(all_buttons)} 个 button 元素:")
+            for i, btn in enumerate(all_buttons):
+                try:
+                    text = btn.text.strip()[:50]
+                    btn_type = btn.get_attribute("type")
+                    log(f"  [{i}] text='{text}', type={btn_type}")
+                except Exception:
+                    pass
+
+            # 检查是否有错误提示
+            error_elements = sb.find_elements('.alert, .error, .invalid, [class*="error"], [class*="invalid"], [class*="danger"]')
+            if error_elements:
+                log(f"发现错误提示: {error_elements[0].text[:100] if error_elements else 'N/A'}")
+
+            # 尝试登录 - 多种字段名
+            logged_in = False
+
+            # 方案1: username + password
+            try:
+                if sb.is_element_present('input[name="username"]'):
+                    sb.type('input[name="username"]', email)
+                    log("已填入用户名")
+                elif sb.is_element_present('input[name="email"]'):
                     sb.type('input[name="email"]', email)
+                    log("已填入邮箱")
                 else:
-                    log("找不到用户名/邮箱输入框")
-                    sb.save_screenshot("error_no_input.png")
-                    error_msg = "找不到登录输入框"
-                    raise Exception(error_msg)
-            else:
-                sb.type('input[name="username"]', email)
+                    # 找第一个 text/email 类型的输入框
+                    inputs = sb.find_elements('input[type="text"], input[type="email"]')
+                    if inputs:
+                        sb.type(inputs[0], email)
+                        log(f"已填入第一个文本输入框")
 
-            # 输入密码
-            if sb.is_element_present('input[name="password"]'):
-                sb.type('input[name="password"]', password)
-            elif sb.is_element_present('input[type="password"]'):
-                sb.type('input[type="password"]', password)
-            else:
-                log("找不到密码输入框")
-                sb.save_screenshot("error_no_password.png")
-                error_msg = "找不到密码输入框"
-                raise Exception(error_msg)
+                if sb.is_element_present('input[name="password"]'):
+                    sb.type('input[name="password"]', password)
+                    log("已填入密码")
+                elif sb.is_element_present('input[type="password"]'):
+                    sb.type('input[type="password"]', password)
+                    log("已填入密码")
 
-            # 点击登录按钮
+            except Exception as e:
+                log(f"填入凭证时出错: {e}")
+
+            # 点击登录
             login_selectors = [
                 'button[type="submit"]',
                 'button:contains("Login")',
                 'button:contains("Sign")',
                 '#login-button',
                 '.btn-primary',
+                'button:contains("登录")',
             ]
 
             clicked = False
@@ -157,31 +187,74 @@ def main():
                     if sb.is_element_present(sel):
                         sb.click(sel)
                         clicked = True
-                        log("已点击登录按钮")
+                        log(f"已点击登录按钮: {sel}")
                         break
                 except Exception:
                     continue
 
             if not clicked:
-                # 尝试按回车
+                buttons = sb.find_elements("button")
+                for btn in buttons:
+                    try:
+                        text = btn.text.strip().lower()
+                        if "login" in text or "sign" in text or "登录" in text:
+                            sb.click(btn)
+                            clicked = True
+                            log(f"通过文本匹配点击: {text}")
+                            break
+                    except Exception:
+                        continue
+
+            if not clicked:
+                # 最后尝试按回车
+                log("尝试按回车提交")
                 sb.send_keys('input[type="password"]', "\n")
-                log("尝试按回车登录")
 
             # 等待页面跳转
-            time.sleep(8)
+            log("等待登录响应...")
+            time.sleep(10)
             sb.save_screenshot("02_after_login.png")
 
-            # 检查是否登录成功（URL 变化或出现仪表盘元素）
             current_url = sb.get_current_url()
-            log(f"登录后 URL: {current_url}")
+            log(f"登录后URL: {current_url}")
 
-            if "auth/login" in current_url:
+            # 检查是否还在登录页
+            if "auth/login" in current_url or "login" in current_url:
+                # 检查是否有错误消息
+                error_text = ""
+                try:
+                    alerts = sb.find_elements('.alert, .error-message, [class*="error"], [class*="invalid"], .text-danger, .bg-danger')
+                    for alert in alerts:
+                        t = alert.text.strip()
+                        if t and len(t) > 3:
+                            error_text = t
+                            log(f"发现错误消息: {error_text[:200]}")
+                            break
+                except Exception:
+                    pass
+
+                if not error_text:
+                    # 检查 body 中是否有错误文本
+                    try:
+                        body_text = sb.get_text("body")
+                        if "错误" in body_text or "error" in body_text.lower() or "invalid" in body_text.lower():
+                            # 提取错误相关文本
+                            lines = body_text.split('\n')
+                            for line in lines:
+                                line = line.strip()
+                                if len(line) > 5 and ('错误' in line or 'error' in line.lower() or 'invalid' in line.lower()):
+                                    error_text = line[:200]
+                                    log(f"从页面文本发现错误: {error_text}")
+                                    break
+                    except Exception:
+                        pass
+
                 log("登录失败：仍在登录页面")
                 sb.save_screenshot("error_login_failed.png")
-                error_msg = "登录失败，可能账号密码错误"
+                error_msg = f"登录失败，仍在登录页面。{'错误: ' + error_text if error_text else ''}"
                 raise Exception(error_msg)
 
-            log("登录成功！")
+            log("✅ 登录成功！")
 
             # ── 第二步：前往仪表盘 ──
             log("正在打开仪表盘...")
@@ -190,8 +263,6 @@ def main():
             sb.save_screenshot("03_dashboard.png")
 
             # ── 第三步：点击 Renew 按钮 ──
-            # FreeGameHost 定制面板有 Renew 按钮
-            # 尝试多种可能的选择器
             renew_selectors = [
                 'button:contains("Renew")',
                 'a:contains("Renew")',
@@ -199,6 +270,8 @@ def main():
                 '[id*="renew"]',
                 'button:contains("Extend")',
                 'a:contains("Extend")',
+                'button:contains("续费")',
+                'a:contains("续费")',
             ]
 
             renewed = False
@@ -213,26 +286,24 @@ def main():
                     continue
 
             if not renewed:
-                # 尝试遍历所有按钮找 Renew 文本
                 try:
                     buttons = sb.find_elements("button")
                     for btn in buttons:
                         text = btn.text.strip().lower()
-                        if "renew" in text or "extend" in text:
+                        if "renew" in text or "extend" in text or "续费" in text:
                             sb.click(btn)
                             renewed = True
-                            log(f"通过文本匹配点击续期按钮: {text}")
+                            log(f"通过文本匹配点击续期: {text}")
                             break
                 except Exception as e:
                     log(f"遍历按钮失败: {e}")
 
             if not renewed:
-                # 尝试链接
                 try:
                     links = sb.find_elements("a")
                     for link in links:
                         text = link.text.strip().lower()
-                        if "renew" in text or "extend" in text:
+                        if "renew" in text or "extend" in text or "续费" in text:
                             sb.click(link)
                             renewed = True
                             log(f"通过文本匹配点击续期链接: {text}")
@@ -249,7 +320,6 @@ def main():
             else:
                 log("⚠️ 未找到续期按钮，可能已续期或页面结构变化")
                 error_msg = "未找到续期按钮"
-                # 检查是否有服务器列表，逐个进入续期
                 try:
                     server_links = sb.find_elements('a[href*="/server/"]')
                     if server_links:
@@ -262,7 +332,6 @@ def main():
                                 time.sleep(3)
                                 sb.save_screenshot(f"server_{i+1}.png")
 
-                                # 在服务器页面找 Renew 按钮
                                 found = False
                                 for sel in renew_selectors:
                                     try:
@@ -276,11 +345,10 @@ def main():
                                         continue
 
                                 if not found:
-                                    # 遍历按钮
                                     btns = sb.find_elements("button")
                                     for btn in btns:
                                         t = btn.text.strip().lower()
-                                        if "renew" in t or "extend" in t:
+                                        if "renew" in t or "extend" in t or "续费" in t:
                                             sb.click(btn)
                                             found = True
                                             log(f"服务器 {i+1} 续期成功（文本匹配）")
