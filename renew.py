@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 FreeGameHost.xyz 自动续期脚本
 使用 SeleniumBase 模拟浏览器登录并点击 Renew 按钮。
@@ -76,7 +76,7 @@ def main():
         browser="chrome",
         headless=True,
         proxy=proxy_arg,
-        gui=False,
+
     ) as sb:
 
         success = False
