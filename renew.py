@@ -57,6 +57,18 @@ def clean_proxy(proxy_str):
     return clean if clean else None
 
 
+def fill_with_js(sb, selector, value):
+    """使用 JavaScript 直接设置输入框值，绕过可能的 UI 阻塞"""
+    sb.execute(f"""
+        const el = document.querySelector('{selector}');
+        if (el) {{
+            el.value = '{value.replace("'", "\\'")}';
+            el.dispatchEvent(new Event('input', {{ bubbles: true }}));
+            el.dispatchEvent(new Event('change', {{ bubbles: true }}));
+        }}
+    """)
+
+
 def main():
     # ── 解析账号 ──
     account = parse_env("FGH_ACCOUNT")
@@ -74,6 +86,8 @@ def main():
     tg_chat_id = tg_bot_token = None
     if tg and len(tg) >= 2:
         tg_chat_id, tg_bot_token = tg[0], tg[1]
+    else:
+        log(f"⚠️ TG_BOT 配置不完整: {tg}")
 
     # ── 代理设置 ──
     browser_proxy_env = os.environ.get("BROWSER_PROXY", None)
@@ -108,165 +122,121 @@ def main():
             # ── 第一步：登录 ──
             log("正在打开登录页面...")
             sb.open(f"{PANEL_URL}/auth/login")
-            time.sleep(8)  # 等待 JS 完全加载
+            time.sleep(8)
 
             # 截图用于调试
             sb.save_screenshot("01_login_page.png")
             log(f"当前URL: {sb.get_current_url()}")
 
-            # 获取页面 HTML 片段用于调试
+            # 检查是否有 CSRF token
+            csrf_value = sb.evaluate("""
+                const csrf = document.querySelector('input[name="csrf_token"]');
+                return csrf ? csrf.value : null;
+            """)
+            if csrf_value:
+                log(f"发现 CSRF token: {csrf_value[:20]}...")
+
+            # ── 方法1: 使用 JavaScript 直接填充并提交 ──
+            log("\n=== 尝试 JS 方式登录 ===")
+            js_success = False
+
             try:
-                body_html = sb.get_text("body")
-                log(f"页面文本长度: {len(body_html)}")
-                # 打印包含错误/失败/invalid 的行
-                lines = body_html.split('\n')
-                for line in lines:
-                    line_lower = line.lower()
-                    if any(kw in line_lower for kw in ['error', 'fail', 'invalid', '错误', '失败', 'invalid']):
-                        log(f"发现关键行: {line.strip()[:200]}")
-            except Exception as e:
-                log(f"获取页面文本失败: {e}")
+                # 使用 JS 填充表单
+                sb.evaluate("""
+                    const userEl = document.querySelector('input[name="username"]');
+                    const passEl = document.querySelector('input[name="password"]');
+                    if (userEl) { userEl.value = arguments[0]; userEl.dispatchEvent(new Event('input', {bubbles:true})); }
+                    if (passEl) { passEl.value = arguments[1]; passEl.dispatchEvent(new Event('input', {bubbles:true})); }
+                """, email, password)
+                log("✅ JS 已填入凭据")
 
-            # ── 诊断所有表单元素 ──
-            log("=== 所有表单元素 ===")
-            all_inputs = sb.find_elements("input")
-            log(f"共 {len(all_inputs)} 个 input:")
-            csrf_token = None
-            for i, inp in enumerate(all_inputs):
-                try:
-                    name = inp.get_attribute("name")
-                    id_attr = inp.get_attribute("id")
-                    type_attr = inp.get_attribute("type") or "text"
-                    value = inp.get_attribute("value")
-                    placeholder = inp.get_attribute("placeholder")
-                    log(f"  [{i}] type={type_attr}, name={name}, id={id_attr}, placeholder={placeholder}")
-                    # 检查 CSRF token
-                    if name and ('csrf' in name.lower() or 'token' in name.lower()):
-                        csrf_token = value
-                        log(f"  ⚠️ 发现可能的 CSRF token: {value[:20] if value else 'None'}...")
-                except Exception:
-                    pass
+                # 等待一下让 JS 框架（如 React/Vue）更新状态
+                time.sleep(1)
 
-            all_buttons = sb.find_elements("button")
-            log(f"共 {len(all_buttons)} 个 button:")
-            for i, btn in enumerate(all_buttons):
-                try:
-                    text = btn.text.strip()[:50]
-                    btn_type = btn.get_attribute("type")
-                    log(f"  [{i}] text='{text}', type={btn_type}")
-                except Exception:
-                    pass
+                # 点击登录按钮
+                click_result = sb.evaluate("""
+                    const btn = document.querySelector('button[type="submit"]');
+                    if (btn) { btn.click(); return 'clicked'; }
+                    return 'not found';
+                """)
+                log(f"点击结果: {click_result}")
 
-            # ── 尝试登录 ──
-            logged_in = False
-            attempts = 0
-
-            while not logged_in and attempts < 2:
-                attempts += 1
-                log(f"\n=== 登录尝试 {attempts} ===")
-
-                # 重新定位元素（防止页面刷新导致元素丢失）
-                try:
-                    user_input = sb.wait_for_element('input[name="username"]', timeout=5)
-                    pass_input = sb.wait_for_element('input[name="password"]', timeout=5)
-                    log("✅ 找到登录表单")
-                except Exception:
-                    # 尝试其他选择器
-                    try:
-                        user_input = sb.wait_for_element('input[type="text"]', timeout=5)
-                        pass_input = sb.wait_for_element('input[type="password"]', timeout=5)
-                        log("✅ 通过类型找到输入框")
-                    except Exception:
-                        log("❌ 找不到登录输入框")
-                        sb.save_screenshot("error_no_form.png")
-                        break
-
-                # 清空并填入
-                try:
-                    user_input.clear()
-                    user_input.send_keys(email)
-                    log(f"已填入用户名: {email}")
-                except Exception as e:
-                    log(f"填入用户名失败: {e}")
-
-                try:
-                    pass_input.clear()
-                    pass_input.send_keys(password)
-                    log(f"已填入密码 (长度{len(password)})")
-                except Exception as e:
-                    log(f"填入密码失败: {e}")
-
-                # 点击登录
-                try:
-                    sb.click('button[type="submit"]')
-                    log("已点击 LOGIN 按钮")
-                except Exception:
-                    try:
-                        sb.click('button:contains("LOGIN")')
-                        log("已点击 LOGIN 按钮 (第二种选择器)")
-                    except Exception as e:
-                        log(f"点击登录按钮失败: {e}")
-                        sb.save_screenshot("error_click_fail.png")
-                        break
-
-                # 等待跳转
+                # 等待登录响应
                 log("等待登录响应...")
-                time.sleep(12)
+                time.sleep(10)
 
                 current_url = sb.get_current_url()
                 log(f"登录后URL: {current_url}")
 
-                if "auth/login" not in current_url and "login" not in current_url:
-                    log("✅ 登录成功！")
-                    logged_in = True
-                    sb.save_screenshot("02_logged_in.png")
+                if "login" not in current_url.lower():
+                    log("✅ JS 登录成功！")
+                    js_success = True
+                    sb.save_screenshot("02_logged_in_js.png")
                 else:
-                    # 检查错误消息
-                    log("\n=== 检查错误消息 ===")
-                    error_found = False
+                    # 检查是否有错误
+                    error_text = sb.evaluate("""
+                        const bodies = document.querySelectorAll('.alert, .error, [class*="error"], [class*="invalid"], .text-danger');
+                        for (const b of bodies) { if (b.textContent.trim()) return b.textContent.trim(); }
+                        return '';
+                    """)
+                    if error_text:
+                        log(f"❌ 服务器返回错误: {error_text[:200]}")
+                    else:
+                        log("⚠️ 登录无响应，仍在登录页")
+                    sb.save_screenshot("03_login_attempt_failed.png")
 
-                    # 方法1: 查找 alert/error 类元素
-                    for selector in ['.alert', '.error', '.invalid', '[class*="error"]',
-                                    '[class*="invalid"]', '.text-danger', '.bg-danger',
-                                    '.flash-error', '.notification-error']:
-                        try:
-                            el = sb.wait_for_element(selector, timeout=2)
-                            text = el.text.strip()
-                            if text:
-                                log(f"发现错误 [{selector}]: {text[:200]}")
-                                error_found = True
-                                break
-                        except Exception:
-                            continue
+            except Exception as e:
+                log(f"JS 登录方式失败: {e}")
 
-                    # 方法2: 在 body 文本中搜索
-                    if not error_found:
-                        try:
-                            body_text = sb.get_text("body")
-                            lines = body_text.split('\n')
-                            for line in lines:
-                                line = line.strip()
-                                if len(line) > 3 and any(kw in line.lower() for kw in
-                                    ['错误', '失败', 'invalid', 'error', 'wrong', 'incorrect', '无效']):
-                                    log(f"发现错误文本: {line[:200]}")
-                                    error_found = True
-                                    break
-                        except Exception:
-                            pass
+            # ── 方法2: 如果 JS 方式失败，尝试标准 Selenium 方式 ──
+            if not js_success:
+                log("\n=== 尝试 Selenium 方式登录 ===")
+                sb.open(f"{PANEL_URL}/auth/login")
+                time.sleep(5)
 
-                    if not error_found:
-                        log("未检测到明确错误消息，但仍在登录页面")
+                try:
+                    # 使用 type() 方法填充
+                    sb.type('input[name="username"]', email)
+                    sb.type('input[name="password"]', password)
+                    log("已填入凭据")
 
-                    sb.save_screenshot(f"03_login_attempt{attempts}_failed.png")
+                    # 点击登录
+                    sb.click('button[type="submit"]')
+                    log("已点击 LOGIN 按钮")
 
-                    # 如果第二次尝试仍然失败，放弃
-                    if attempts >= 2:
-                        break
+                    # 等待
+                    time.sleep(10)
+                    current_url = sb.get_current_url()
+                    log(f"登录后URL: {current_url}")
 
-            if not logged_in:
-                error_msg = "登录失败：账号密码错误或需要额外验证"
+                    if "login" not in current_url.lower():
+                        log("✅ Selenium 登录成功！")
+                        js_success = True
+                        sb.save_screenshot("02_logged_in_sb.png")
+                    else:
+                        sb.save_screenshot("03_login_attempt_failed2.png")
+                except Exception as e:
+                    log(f"Selenium 登录方式也失败: {e}")
+                    sb.save_screenshot("error_sb_login_fail.png")
+
+            # ── 验证登录结果 ──
+            if not js_success:
+                final_url = sb.get_current_url()
+                log(f"\n最终URL: {final_url}")
+
+                # 再次检查错误
+                try:
+                    error_text = sb.get_text(".alert, .error, [class*='error'], [class*='invalid']")
+                    if error_text.strip():
+                        log(f"页面错误: {error_text.strip()[:200]}")
+                except Exception:
+                    pass
+
+                error_msg = "登录失败：请检查账号密码是否正确，或站点是否需要额外验证"
                 sb.save_screenshot("error_login_final.png")
                 raise Exception(error_msg)
+
+            log("✅ 登录成功！")
 
             # ── 第二步：前往仪表盘 ──
             log("正在打开仪表盘...")
