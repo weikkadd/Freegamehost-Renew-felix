@@ -1050,31 +1050,46 @@ def solve_recaptcha(page):
 def rotate_warp_ip():
     """Rotate Cloudflare WARP exit IP by disconnecting and reconnecting.
     
-    Returns True if rotation succeeded, False otherwise.
+    Returns True if rotation succeeded AND new IP differs from previous, False otherwise.
     Used to escape Google reCAPTCHA's IP-based blocking.
     """
-    log("Rotating WARP IP...")
+    # Get current IP first
     try:
-        # Disconnect WARP
-        log("  disconnecting WARP...")
-        os.system("warp-cli disconnect 2>&1 | tail -3")
-        time.sleep(3)
-        # Reconnect WARP
-        log("  reconnecting WARP...")
-        os.system("warp-cli connect 2>&1 | tail -3")
-        time.sleep(5)
-        # Verify new IP
+        r = requests.get("https://api.ipify.org", timeout=10)
+        old_ip = r.text.strip()
+        log(f"Rotating WARP IP... (current IP: {old_ip})")
+    except Exception:
+        old_ip = None
+        log("Rotating WARP IP... (could not get current IP)")
+    
+    # Try rotation up to 3 times until IP actually changes
+    for attempt in range(3):
         try:
-            r = requests.get("https://api.ipify.org", timeout=10)
-            new_ip = r.text.strip()
-            log(f"  new WARP exit IP: {new_ip}")
-            return True
+            log(f"  attempt {attempt+1}/3: disconnecting WARP...")
+            os.system("warp-cli disconnect --accept-tos 2>&1 | tail -3")
+            time.sleep(3)
+            log(f"  attempt {attempt+1}/3: reconnecting WARP...")
+            os.system("warp-cli connect --accept-tos 2>&1 | tail -3")
+            time.sleep(5)
+            # Verify new IP
+            try:
+                r = requests.get("https://api.ipify.org", timeout=10)
+                new_ip = r.text.strip()
+                if new_ip != old_ip:
+                    log(f"  ✓ WARP IP changed: {old_ip} → {new_ip}")
+                    return True
+                else:
+                    log(f"  IP unchanged ({new_ip}), will retry rotation", "WARN")
+            except Exception as e:
+                log(f"  failed to verify new IP: {e}", "WARN")
+                # Can't verify, assume it changed
+                return True
         except Exception as e:
-            log(f"  failed to verify new IP: {e}", "WARN")
-            return True  # assume it worked
-    except Exception as e:
-        log(f"WARP rotation failed: {e}", "ERROR")
-        return False
+            log(f"  WARP rotation attempt {attempt+1} failed: {e}", "WARN")
+        time.sleep(2)
+    
+    log("WARP rotation failed after 3 attempts (IP never changed)", "ERROR")
+    return False
 
 
 def capture_screenshot(page, filename):
@@ -1138,7 +1153,7 @@ def main():
         """)
 
         # Retry loop for login + reCAPTCHA — on IP block, rotate WARP and retry
-        MAX_IP_ROTATIONS = 3
+        MAX_IP_ROTATIONS = 5
         for ip_attempt in range(MAX_IP_ROTATIONS):
             if ip_attempt > 0:
                 log(f"=== Retry attempt {ip_attempt+1}/{MAX_IP_ROTATIONS} after WARP IP rotation ===")
