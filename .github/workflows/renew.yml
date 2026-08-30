@@ -57,6 +57,7 @@ jobs:
       - name: 🚀 运行续期脚本
         env:
           PYTHONIOENCODING: utf-8
+          BROWSER_PROXY: http://127.0.0.1:8080
           FGH_ACCOUNT: ${{ secrets.FGH_ACCOUNT }}
           GOST_PROXY: ${{ secrets.GOST_PROXY }}
           TG_BOT: ${{ secrets.TG_BOT }}
