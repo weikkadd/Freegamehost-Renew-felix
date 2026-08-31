@@ -5,6 +5,10 @@ on:
   schedule:
     - cron: '25 */4 * * *'
 
+permissions:
+  actions: write
+  contents: read
+
 jobs:
   run_fgh_renew:
     runs-on: ubuntu-latest
@@ -31,7 +35,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install DrissionPage xvfbwrapper "requests[socks]" SpeechRecognition pydub
 
-      - name: 📥 安装 sing-box
+      - name: 📥 安装 sing-box（仅配置了 PROXY_URI 机场节点时）
+        if: secrets.PROXY_URI != ''
         run: |
           SINGBOX_VERSION="1.12.0"
           SINGBOX_URL="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
@@ -55,6 +60,22 @@ jobs:
           sudo cp /tmp/sing-box-${SINGBOX_VERSION}-linux-amd64/sing-box /usr/local/bin/sing-box
           sudo chmod +x /usr/local/bin/sing-box
           /usr/local/bin/sing-box version
+
+      - name: 🌐 启用 WARP 网络（出口为 Cloudflare 消费者 IP，reCAPTCHA 信任，绕过数据中心 IP 软限制）
+        uses: fscarmen/warp-on-actions@v1.3
+        with:
+          stack: dual
+          mode: client
+
+      - name: 🔧 修复 DNS（WARP 接管后 systemd-resolved 会干扰解析）
+        run: |
+          sudo systemctl stop systemd-resolved 2>/dev/null || true
+          sudo systemctl disable systemd-resolved 2>/dev/null || true
+          sudo rm -f /etc/resolv.conf
+          echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 1.0.0.1" | sudo tee /etc/resolv.conf
+          sleep 2
+          curl -s --max-time 10 https://api.ipify.org && echo
+          curl -s --max-time 10 https://www.cloudflare.com/cdn-cgi/trace | grep -E 'ip=|warp=|loc=' || true
 
       - name: 🔍 网络诊断
         run: |

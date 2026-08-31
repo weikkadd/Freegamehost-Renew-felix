@@ -12,6 +12,8 @@ import random
 import html
 import json
 import signal
+import shutil
+import subprocess
 import requests
 import tempfile
 from datetime import datetime
@@ -44,6 +46,113 @@ class BlockedError(Exception):
     stuck disabled for >5s after submitting answer). This should trigger WARP IP
     rotation in the caller."""
     pass
+
+
+class WarpManager:
+    """系统级 WARP VPN IP 轮换。
+
+    WARP 的出口是 Cloudflare 消费者 IP 池, Google reCAPTCHA 对这类 IP 的
+    音频验证能正常响应(数据中心 IP 会被软限制, verify 按钮永久 disabled)。
+    需要 runner 上已安装 warp-cli 并连接(fscarmen/warp-on-actions)。
+    _used_ips 记录本次运行已用过的 IP, 重复时自动重试。
+    """
+    def __init__(self):
+        self._used_ips = set()
+
+    def _run(self, args, timeout=30):
+        cmd = ["sudo", "warp-cli", "--accept-tos"] + args
+        log(f"[WARP] 执行: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if result.stdout.strip():
+            log(f"[WARP] stdout: {result.stdout.strip()}")
+        if result.stderr.strip():
+            log(f"[WARP] stderr: {result.stderr.strip()}", "WARN")
+        return result
+
+    def _get_current_ip(self):
+        try:
+            r = subprocess.run(
+                ["curl", "-s", "--max-time", "15", "https://api.ipify.org"],
+                capture_output=True, text=True, timeout=20)
+            return r.stdout.strip()
+        except Exception:
+            return ""
+
+    def _wait_connected(self, max_wait=60):
+        log(f"[WARP] 等待 VPN 连接就绪（最多 {max_wait}s）...")
+        start = time.time()
+        while time.time() - start < max_wait:
+            try:
+                r = subprocess.run(
+                    ["curl", "-s", "--max-time", "10",
+                     "https://www.cloudflare.com/cdn-cgi/trace"],
+                    capture_output=True, text=True, timeout=15)
+                trace = r.stdout
+                if "warp=on" in trace or "warp=plus" in trace:
+                    ip_lines = [l for l in trace.splitlines() if l.startswith("ip=")]
+                    ip = ip_lines[0].split("=")[1] if ip_lines else "unknown"
+                    log(f"[WARP] ✅ VPN 就绪，出口 IP: {ip}")
+                    return True
+            except Exception as e:
+                log(f"[WARP] 等待中... ({e})", "WARN")
+            time.sleep(3)
+        log("[WARP] ❌ 等待超时，warp 未激活", "ERROR")
+        return False
+
+    def _do_one_rotate(self):
+        """注销 → 重注册 → 连接, 返回新 IP, 失败返回空字符串"""
+        self._run(["disconnect"])
+        time.sleep(2)
+        self._run(["registration", "delete"])
+        time.sleep(2)
+        result = self._run(["registration", "new"], timeout=30)
+        if result.returncode != 0:
+            log("[WARP] ❌ 注册失败", "ERROR")
+            return ""
+        time.sleep(3)
+        self._run(["connect"])
+        time.sleep(5)
+        if not self._wait_connected(max_wait=60):
+            log("[WARP] ❌ WARP 连接失败", "ERROR")
+            return ""
+        return self._get_current_ip()
+
+    def rotate_ip(self, attempt_idx=0, max_attempts=8):
+        """轮换 WARP IP。新 IP 与本次运行已用过的去重, 最多尝试 max_attempts 次。"""
+        log(f"[WARP] ========== 第 {attempt_idx + 1} 次 IP 轮换 ==========")
+        log(f"[WARP] 已用 IP 池: {self._used_ips if self._used_ips else '(空)'}")
+        old_ip = self._get_current_ip()
+        log(f"[WARP] 旧 IP: {old_ip}")
+        for i in range(1, max_attempts + 1):
+            log(f"[WARP] 轮换尝试 {i}/{max_attempts}")
+            new_ip = self._do_one_rotate()
+            if not new_ip:
+                log(f"[WARP] ⚠️  第 {i} 次轮换失败，继续重试", "WARN")
+                continue
+            if new_ip in self._used_ips:
+                log(f"[WARP] ♻️  IP {new_ip} 已被本次运行使用过，继续尝试...", "WARN")
+                continue
+            self._used_ips.add(new_ip)
+            log(f"[WARP] ✅ IP 已变化: {old_ip} → {new_ip}")
+            return True
+        log(f"[WARP] ⚠️  {max_attempts} 次尝试均为重复 IP，使用当前 IP 继续执行", "WARN")
+        return True
+
+    def record_initial_ip(self):
+        ip = self._get_current_ip()
+        if ip:
+            self._used_ips.add(ip)
+            log(f"[WARP] 记录初始 IP: {ip}")
+
+
+_warp_manager = None
+
+
+def get_warp_manager() -> WarpManager:
+    global _warp_manager
+    if _warp_manager is None:
+        _warp_manager = WarpManager()
+    return _warp_manager
 
 
 def log(msg, level="INFO"):
@@ -1176,10 +1285,20 @@ def main():
     tg_token = os.environ.get("TG_BOT_TOKEN", "").strip()
     tg_chat_id = os.environ.get("TG_CHAT_ID", "").strip()
 
+    # 网络模式: 优先 WARP(系统级 VPN, 出口为 Cloudflare 消费者 IP 池,
+    # Google reCAPTCHA 信任此类 IP, 音频验证能正常响应);
+    # 无 WARP 时回退 PROXY_URI 机场节点(数据中心 IP, reCAPTCHA 软限制, 成功率低)
+    warp_available = shutil.which("warp-cli") is not None
+    if warp_available:
+        log("✅ 检测到 WARP (warp-cli), 使用系统级 VPN — Chrome 无需代理")
+        get_warp_manager().record_initial_ip()
+    else:
+        log("⚠️ 未检测到 warp-cli, 回退使用 PROXY_URI 机场节点代理", "WARN")
+
     # Initialize proxy manager and start first proxy if PROXY_URI is set
     proxy_active = init_proxy_manager()
     proxy_url = None
-    if proxy_active:
+    if proxy_active and not warp_available:
         if _proxy_manager.start(0):
             proxy_url = _proxy_manager.get_socks5_url()
             log(f"Browser will use proxy: {proxy_url}")
@@ -1233,7 +1352,7 @@ def main():
         """)
 
         # Retry loop for login + reCAPTCHA — on IP block, rotate proxy and retry
-        MAX_IP_ROTATIONS = 5
+        MAX_IP_ROTATIONS = 10
         for ip_attempt in range(MAX_IP_ROTATIONS):
             if ip_attempt > 0:
                 log(f"=== Retry attempt {ip_attempt+1}/{MAX_IP_ROTATIONS} after proxy rotation ===")
@@ -1285,59 +1404,59 @@ def main():
                             raise
 
             if ip_blocked:
-                # 只有一个节点时轮换换不到新 IP(还是同一个出口), 直接同 IP 重试更实际
-                if _proxy_manager and len(_proxy_manager.proxies) <= 1:
+                if warp_available:
+                    # WARP 模式: 轮换 WARP IP(出口为 Cloudflare 消费者 IP, reCAPTCHA 信任)
+                    if ip_attempt + 1 >= MAX_IP_ROTATIONS:
+                        error_msg = "Max WARP IP rotations reached, Google reCAPTCHA still blocking"
+                        log(f"ERROR: {error_msg}", "ERROR")
+                        raise Exception(error_msg)
+                    log(f"Rotating WARP IP (attempt {ip_attempt+1}/{MAX_IP_ROTATIONS})...")
+                    get_warp_manager().rotate_ip(attempt_idx=ip_attempt)
+                elif _proxy_manager and len(_proxy_manager.proxies) <= 1:
+                    # 只有一个节点时轮换换不到新 IP(还是同一个出口), 直接同 IP 重试更实际
                     log(f"Only 1 proxy node — rotation won't change IP, retrying same IP (attempt {ip_attempt+1}/{MAX_IP_ROTATIONS})", "WARN")
                     time.sleep(5)
                     continue
-                # Rotate proxy and retry the whole login + reCAPTCHA flow
-                if ip_attempt + 1 < MAX_IP_ROTATIONS:
+                else:
+                    # 机场多节点: 轮换到下一个节点
+                    if ip_attempt + 1 >= MAX_IP_ROTATIONS:
+                        error_msg = "Max proxy rotations reached, Google reCAPTCHA still blocking"
+                        log(f"ERROR: {error_msg}", "ERROR")
+                        raise Exception(error_msg)
                     log(f"Rotating proxy (attempt {ip_attempt+1}/{MAX_IP_ROTATIONS})...")
                     if not rotate_proxy():
                         log("Proxy rotation failed, retrying with same proxy", "WARN")
                         time.sleep(5)
                         continue
-                    # CRITICAL: Chrome's --proxy-server arg is set at startup.
-                    # Switching sing-box's outbound doesn't change Chrome's connection.
-                    # We must restart Chrome so it picks up the new proxy config.
-                    # The socks5 listener URL (127.0.0.1:10808) stays the same —
-                    # but sing-box now routes to a different upstream node.
-                    # Actually, since sing-box's listener is the same and we just
-                    # replaced its outbound config, existing connections might
-                    # still use old node. But Chrome opens NEW connections for
-                    # each request, so it should pick up the new outbound.
-                    # Still, to be safe, we restart Chrome.
-                    try:
-                        page.quit()
-                    except Exception:
-                        pass
-                    time.sleep(2)
-                    # Recreate Chrome with same options (proxy URL unchanged)
-                    co_new = ChromiumOptions()
-                    co_new.set_browser_path('/usr/bin/google-chrome')
-                    co_new.set_argument('--no-sandbox')
-                    co_new.set_argument('--disable-dev-shm-usage')
-                    co_new.set_argument('--disable-gpu')
-                    co_new.set_argument('--disable-setuid-sandbox')
-                    co_new.set_argument('--disable-software-rasterizer')
-                    co_new.set_argument('--disable-extensions')
-                    co_new.set_argument('--no-first-run')
-                    co_new.set_argument('--no-default-browser-check')
-                    co_new.set_argument('--window-size=1920,1080')
-                    co_new.set_argument('--log-level=3')
-                    if _proxy_manager and _proxy_manager.singbox_proc:
-                        co_new.set_argument(f'--proxy-server={_proxy_manager.get_socks5_url()}')
-                        log(f"Chrome restarted with proxy: {_proxy_manager.get_socks5_url()}")
-                    co_new.headless(False)
-                    page = ChromiumPage(co_new)
-                    page.run_js("""
-                        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                    """)
-                    continue
+                # 轮换后重启 Chrome, 使新网络(新 WARP IP / 新节点)生效
+                try:
+                    page.quit()
+                except Exception:
+                    pass
+                time.sleep(2)
+                co_new = ChromiumOptions()
+                co_new.set_browser_path('/usr/bin/google-chrome')
+                co_new.set_argument('--no-sandbox')
+                co_new.set_argument('--disable-dev-shm-usage')
+                co_new.set_argument('--disable-gpu')
+                co_new.set_argument('--disable-setuid-sandbox')
+                co_new.set_argument('--disable-software-rasterizer')
+                co_new.set_argument('--disable-extensions')
+                co_new.set_argument('--no-first-run')
+                co_new.set_argument('--no-default-browser-check')
+                co_new.set_argument('--window-size=1920,1080')
+                co_new.set_argument('--log-level=3')
+                if _proxy_manager and _proxy_manager.singbox_proc:
+                    co_new.set_argument(f'--proxy-server={_proxy_manager.get_socks5_url()}')
+                    log(f"Chrome restarted with proxy: {_proxy_manager.get_socks5_url()}")
                 else:
-                    error_msg = "Max proxy rotations reached, Google reCAPTCHA still blocking"
-                    log(f"ERROR: {error_msg}", "ERROR")
-                    raise Exception(error_msg)
+                    log("Chrome restarted (WARP 系统级网络)")
+                co_new.headless(False)
+                page = ChromiumPage(co_new)
+                page.run_js("""
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                """)
+                continue
 
             if "login" in page.url.lower():
                 error_msg = "Login failed: check username/password"
