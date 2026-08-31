@@ -273,6 +273,49 @@ def parse_hysteria(uri: str) -> dict:
     }
 
 
+def parse_tuic(uri: str) -> dict:
+    """Parse tuic://uuid:password@host:port?sni=...&alpn=...&congestion_control=...#name"""
+    if not uri.startswith('tuic://'):
+        raise ValueError(f"Not a tuic URI: {uri[:30]}")
+    rest = uri[len('tuic://'):]
+    if '#' in rest:
+        rest, fragment = rest.split('#', 1)
+        fragment = urllib.parse.unquote(fragment)
+    else:
+        fragment = ''
+    if '?' in rest:
+        main, query = rest.split('?', 1)
+        params = dict(urllib.parse.parse_qsl(query))
+    else:
+        main = rest
+        params = {}
+    if '@' in main:
+        userinfo, hostport = main.rsplit('@', 1)
+        if ':' in userinfo:
+            uuid, password = userinfo.split(':', 1)
+        else:
+            uuid, password = userinfo, ''
+        uuid = urllib.parse.unquote(uuid)
+        password = urllib.parse.unquote(password)
+    else:
+        raise ValueError(f"tuic URI missing userinfo: {uri[:50]}")
+    if ':' in hostport:
+        host, port = hostport.rsplit(':', 1)
+        port = int(port)
+    else:
+        host = hostport
+        port = 443
+    return {
+        'protocol': 'tuic',
+        'uuid': uuid,
+        'password': password,
+        'host': host,
+        'port': port,
+        'params': params,
+        'name': fragment,
+    }
+
+
 def parse_proxy_uri(uri: str) -> dict:
     """Parse any supported proxy URI. Returns dict with at least 'protocol', 'host', 'port'."""
     uri = uri.strip()
@@ -288,6 +331,8 @@ def parse_proxy_uri(uri: str) -> dict:
         return parse_ss(uri)
     elif uri.startswith('hysteria2://') or uri.startswith('hy2://'):
         return parse_hysteria2(uri)
+    elif uri.startswith('tuic://'):
+        return parse_tuic(uri)
     elif uri.startswith('hysteria://'):
         return parse_hysteria(uri)
     else:
@@ -460,6 +505,22 @@ def build_singbox_config(proxy: dict, listen_port: int = 10808) -> dict:
                 "password": params.get('obfs-password', ''),
             }
     
+    elif proxy['protocol'] == 'tuic':
+        params = proxy.get('params', {})
+        outbound.update({
+            "type": "tuic",
+            "server": proxy['host'],
+            "server_port": proxy['port'],
+            "uuid": proxy['uuid'],
+            "password": proxy['password'],
+            "congestion_control": params.get('congestion_control', 'bbr'),
+            "tls": {
+                "enabled": True,
+                "server_name": params.get('sni', proxy['host']),
+                "alpn": [params.get('alpn', 'h3')],
+            },
+        })
+
     elif proxy['protocol'] == 'hysteria':
         params = proxy.get('params', {})
         tls = {
