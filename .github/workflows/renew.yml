@@ -13,6 +13,8 @@ jobs:
   run_fgh_renew:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      PROXY_URI: ${{ secrets.PROXY_URI }}
 
     steps:
       - name: 📥 检出仓库代码
@@ -36,7 +38,7 @@ jobs:
           pip install DrissionPage xvfbwrapper "requests[socks]" SpeechRecognition pydub
 
       - name: 📥 安装 sing-box（仅配置了 PROXY_URI 机场节点时）
-        if: secrets.PROXY_URI != ''
+        if: env.PROXY_URI != ''
         run: |
           SINGBOX_VERSION="1.12.0"
           SINGBOX_URL="https://github.com/SagerNet/sing-box/releases/download/v${SINGBOX_VERSION}/sing-box-${SINGBOX_VERSION}-linux-amd64.tar.gz"
