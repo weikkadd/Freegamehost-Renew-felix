@@ -1331,6 +1331,12 @@ def main():
         co.set_argument('--no-default-browser-check')
         co.set_argument('--window-size=1920,1080')
         co.set_argument('--log-level=3')
+        co.set_argument('--disable-popup-blocking')
+        co.set_argument('--silent')
+        # 每次独立用户数据目录 + 自动端口: 避免残留 cookie/指纹, 降低被 reCAPTCHA 识别的概率
+        user_data_dir = tempfile.mkdtemp()
+        co.set_user_data_path(user_data_dir)
+        co.auto_port()
         # Use socks5 proxy if active
         if proxy_url:
             co.set_argument(f'--proxy-server={proxy_url}')
@@ -1339,7 +1345,8 @@ def main():
 
         page = ChromiumPage(co)
 
-        page.run_js("""
+        # 反指纹注入必须用 add_init_js(页面加载前), run_js 太晚, reCAPTCHA 已加载完
+        page.add_init_js("""
             const getParameter = WebGLRenderingContext.prototype.getParameter;
             WebGLRenderingContext.prototype.getParameter = function(parameter) {
                 if (parameter === 37445) return 'Intel Inc.';
@@ -1361,7 +1368,20 @@ def main():
             page.get(f"{PANEL_URL}/auth/login")
             time.sleep(15)
             page.get_screenshot(f"{SCREENSHOT_DIR}/01_login_page.png")
-            
+
+            # 模拟真人行为: 滚动 + 鼠标移动, 积累行为数据降低自动化特征
+            for _ in range(3):
+                try:
+                    page.scroll.down(random.randint(200, 500))
+                except Exception:
+                    pass
+                time.sleep(random.uniform(0.5, 1.0))
+                try:
+                    page.actions.move(random.randint(100, 700), random.randint(100, 500))
+                except Exception:
+                    pass
+                time.sleep(random.uniform(0.3, 0.8))
+
             debug_page(page)
             fill_ok = fill_login_form(page, email, password)
             if not fill_ok:
@@ -1446,6 +1466,11 @@ def main():
                 co_new.set_argument('--no-default-browser-check')
                 co_new.set_argument('--window-size=1920,1080')
                 co_new.set_argument('--log-level=3')
+                co_new.set_argument('--disable-popup-blocking')
+                co_new.set_argument('--silent')
+                user_data_dir = tempfile.mkdtemp()
+                co_new.set_user_data_path(user_data_dir)
+                co_new.auto_port()
                 if _proxy_manager and _proxy_manager.singbox_proc:
                     co_new.set_argument(f'--proxy-server={_proxy_manager.get_socks5_url()}')
                     log(f"Chrome restarted with proxy: {_proxy_manager.get_socks5_url()}")
@@ -1453,8 +1478,10 @@ def main():
                     log("Chrome restarted (WARP 系统级网络)")
                 co_new.headless(False)
                 page = ChromiumPage(co_new)
-                page.run_js("""
+                page.add_init_js("""
                     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3]});
                 """)
                 continue
 
