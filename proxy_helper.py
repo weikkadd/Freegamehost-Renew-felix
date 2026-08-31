@@ -291,6 +291,9 @@ def parse_tuic(uri: str) -> dict:
         params = {}
     if '@' in main:
         userinfo, hostport = main.rsplit('@', 1)
+        # 关键: 必须先 unquote 再 split —— 分隔冒号可能被 URL 编码为 %3A,
+        # 不先解码会导致 <uuid>:<password> 整体被当成 uuid(实测用户节点正是此格式)
+        userinfo = urllib.parse.unquote(userinfo)
         # 诊断: 打印解析到的 userinfo 结构(密码打码), 便于定位 URL 格式问题
         userinfo_masked = userinfo
         if ':' in userinfo_masked:
@@ -301,8 +304,6 @@ def parse_tuic(uri: str) -> dict:
             uuid, password = userinfo.split(':', 1)
         else:
             uuid, password = userinfo, ''
-        uuid = urllib.parse.unquote(uuid)
-        password = urllib.parse.unquote(password)
         # UUID 格式校验: 标准 8-4-4-4-12 或 32 位 hex。防 uuid 字段被拼入
         # 额外内容(如 <uuid>:<password>)时 sing-box 报 invalid uuid 的问题
         import re as _re
@@ -529,6 +530,7 @@ def build_singbox_config(proxy: dict, listen_port: int = 10808) -> dict:
                 "enabled": True,
                 "server_name": params.get('sni', proxy['host']),
                 "alpn": [params.get('alpn', 'h3')],
+                "insecure": params.get('allow_insecure', '0') == '1' or params.get('insecure', '0') == '1',
             },
         })
 
