@@ -291,12 +291,23 @@ def parse_tuic(uri: str) -> dict:
         params = {}
     if '@' in main:
         userinfo, hostport = main.rsplit('@', 1)
+        # 诊断: 打印解析到的 userinfo 结构(密码打码), 便于定位 URL 格式问题
+        userinfo_masked = userinfo
+        if ':' in userinfo_masked:
+            u_part, p_part = userinfo_masked.split(':', 1)
+            userinfo_masked = f"{u_part}:***"
+        log(f"parse_tuic: userinfo={userinfo_masked} hostport={hostport}")
         if ':' in userinfo:
             uuid, password = userinfo.split(':', 1)
         else:
             uuid, password = userinfo, ''
         uuid = urllib.parse.unquote(uuid)
         password = urllib.parse.unquote(password)
+        # UUID 格式校验: 标准 8-4-4-4-12 或 32 位 hex。防 uuid 字段被拼入
+        # 额外内容(如 <uuid>:<password>)时 sing-box 报 invalid uuid 的问题
+        import re as _re
+        if not _re.fullmatch(r'[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}|[0-9a-fA-F]{32}', uuid):
+            raise ValueError(f"tuic uuid 格式非法(应为标准 UUID 或 32 位 hex): {uuid[:60]}")
     else:
         raise ValueError(f"tuic URI missing userinfo: {uri[:50]}")
     if ':' in hostport:
