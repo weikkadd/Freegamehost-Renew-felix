@@ -1,4 +1,4 @@
-# 🎮 FGH-Renew
+# 🎮 FGH-Renew   https://panel.freegamehost.xyz/
 
 自动续期 FreeGameHost 服务器，每 4 小时运行一次，支持 reCAPTCHA 自动破解。
 
