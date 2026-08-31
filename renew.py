@@ -30,6 +30,27 @@ except ImportError:
     print("[WARN] speech_recognition/pydub not installed")
     sr = None
 
+# Whisper for high-accuracy reCAPTCHA audio recognition
+# (Google Speech API mis-recognizes synthetic reCAPTCHA audio as conversational sentences)
+_whisper_model = None
+def _get_whisper_model():
+    global _whisper_model
+    if _whisper_model is None:
+        try:
+            from faster_whisper import WhisperModel
+            # base model: 75MB, ~2-3s/segment on CPU. Accurate enough for short digits/words.
+            # int8 = CPU-friendly, ~150MB RAM usage
+            log("[Whisper] Loading base model (int8)...")
+            _whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
+            log("[Whisper] ✓ Model loaded")
+        except ImportError as e:
+            log(f"[Whisper] faster_whisper not installed: {e}", "WARN")
+            _whisper_model = False  # mark as unavailable
+        except Exception as e:
+            log(f"[Whisper] failed to load model: {e}", "WARN")
+            _whisper_model = False
+    return _whisper_model if _whisper_model is not False else None
+
 PANEL_URL = "https://panel.freegamehost.xyz"
 MAX_CAPTCHA_ATTEMPTS = 10
 SCREENSHOT_DIR = "output/screenshots"
@@ -311,17 +332,22 @@ def is_blocked(page):
     1. The 'doscaptcha' page (Try again later) — explicit block
     2. ALL bframe buttons disabled — implicit block when verify button stays disabled
        after we've already submitted an answer (Google is preventing further attempts)
+    
+    NOTE: .rc-audiochallenge-error-message is NOT a block signal — it appears for
+    normal wrong-answer feedback ("Try again"). Only the doscaptcha header
+    indicates a real block. Treating normal wrong-answer as blocked would cause
+    premature IP rotation when only one proxy node is available (wastes 5 cycles).
     """
     bframe = find_recaptcha_frame(page, "bframe")
     if not bframe:
         return False
     try:
         return bool(bframe.run_js("""
-            // Check 1: explicit 'try again later' page
+            // Check 1: explicit 'try again later' page (real block)
             const h = document.querySelector('.rc-doscaptcha-header-text');
             if (h && h.textContent.toLowerCase().includes('try again later')) return true;
-            const e = document.querySelector('.rc-audiochallenge-error-message');
-            if (e && e.offsetParent !== null) return true;
+            // NOTE: .rc-audiochallenge-error-message removed — it appears for normal
+            // wrong answers, not for blocks. Treating it as block causes false positives.
             // Check 2: verify button stuck in disabled state with audio-response input present
             // (means we've already submitted an answer but Google won't let us retry)
             const verify = document.querySelector('#recaptcha-verify-button');
@@ -815,7 +841,7 @@ def fill_and_verify(page, text):
     # 尤其是在只有一个代理节点时, 误报触发轮换也换不到新 IP)。
     log("fill_and_verify: waiting for Google to process verify response...")
     start = time.time()
-    while time.time() - start < 30:
+    while time.time() - start < 8:
         # Best case: solved
         if is_recaptcha_solved(page):
             log(f"fill_and_verify: ✓ reCAPTCHA solved after {time.time()-start:.1f}s")
@@ -860,8 +886,11 @@ def fill_and_verify(page, text):
             pass
         time.sleep(0.5)
 
-    # 20s 超时且无明确 block 消息 → 保守按"答案未通过"处理, 让调用方 reload 重试。
+    # 8s 超时且无明确 block 消息 → 保守按"答案未通过"处理, 让调用方 reload 重试。
     # 不轻易判定 blocked(单节点下轮换无效, 且误报会白跑整个重试循环)
+    # 说明: 之前是 30s 但实测 Google 在答案错时会在 1-3s 内重新启用按钮
+    # (返回 False), 如果 8s 还没启用说明 Google 进入了"多次错答"的封禁状态
+    # (但 is_blocked 会进一步检测确认是否真的 blocked)
     elapsed = time.time() - start
     log(f"fill_and_verify: verify button still disabled after {elapsed:.1f}s without block message, treating as rejected", "WARN")
     return False
@@ -893,34 +922,81 @@ def download_audio(url):
 
 
 def recognize_audio(mp3_path):
-    """Recognize audio captcha using multiple strategies for better accuracy."""
+    """Recognize reCAPTCHA audio using faster-whisper (primary) + Google Speech (fallback).
+    
+    Whisper is dramatically better at reCAPTCHA's synthetic audio (short digits/words)
+    than Google Speech API, which is tuned for conversational speech and mis-recognizes
+    reCAPTCHA audio as full sentences like 'investment banker arkansas' or
+    'browsing no searching up' (which are wrong — reCAPTCHA expects digit strings
+    or short word lists).
+    
+    Returns the recognized text (lowercased, whitespace-normalized) or None.
+    """
     if sr is None:
-        return None
+        # Even if SpeechRecognition isn't installed, Whisper can still work
+        pass
+    
     wav_path = mp3_path.replace(".mp3", ".wav")
     try:
         audio_seg = AudioSegment.from_mp3(mp3_path)
-        # Diagnostic: log audio info
         duration_s = len(audio_seg) / 1000.0
-        # Use dBFS to check if audio is essentially silent
         dbfs = audio_seg.dBFS
         log(f"recognize_audio: audio duration={duration_s:.2f}s, dBFS={dbfs:.1f}, channels={audio_seg.channels}, frame_rate={audio_seg.frame_rate}")
-        # Strip silence from the beginning/end and boost low audio
+        # Strip silence and boost quiet audio (same as before)
         audio_seg = audio_seg.strip_silence(silence_thresh=-40, silence_len=100)
-        # Normalize to -10 dBFS so Google API can hear it well
         if audio_seg.dBFS < -20:
             log(f"recognize_audio: audio is quiet ({audio_seg.dBFS:.1f} dBFS), boosting")
-            target_dbfs = -10
-            gain = target_dbfs - audio_seg.dBFS
+            gain = -10 - audio_seg.dBFS
             audio_seg = audio_seg.apply_gain(gain)
+        # Export as 16kHz mono WAV (whisper requirement)
+        audio_seg = audio_seg.set_frame_rate(16000).set_channels(1)
         audio_seg.export(wav_path, format="wav")
     except Exception as e:
         log(f"recognize_audio: MP3->WAV conversion failed: {e}", "ERROR")
         return None
 
-    results = []
+    result_text = None
     try:
+        # === Primary: faster-whisper ===
+        whisper_model = _get_whisper_model()
+        if whisper_model is not None:
+            try:
+                log("[Whisper] transcribing...")
+                # beam_size=1 for speed (reCAPTCHA audio is short, ~3-5s)
+                # language='en' forced (reCAPTCHA audio is always English)
+                # without_timestamps=True for short audio
+                segments, _info = whisper_model.transcribe(
+                    wav_path,
+                    language="en",
+                    beam_size=1,
+                    without_timestamps=True,
+                    # Suppress non-speech tokens - reCAPTCHA audio has no background music
+                    no_speech_threshold=0.7,
+                )
+                # segments is a generator, collect text
+                transcript_parts = []
+                for seg in segments:
+                    if seg.text.strip():
+                        transcript_parts.append(seg.text.strip())
+                if transcript_parts:
+                    result_text = ' '.join(transcript_parts).strip()
+                    # Normalize: lowercase + collapse whitespace
+                    result_text = ' '.join(result_text.lower().split())
+                    log(f"[Whisper] ✓ result: '{result_text}' (lang={_info.language}, prob={_info.language_probability:.2f})")
+                    return result_text
+                else:
+                    log("[Whisper] empty transcript", "WARN")
+            except Exception as e:
+                log(f"[Whisper] transcribe failed: {e}", "WARN")
+                # Fall through to Google Speech fallback
+        
+        # === Fallback: Google Speech API (old logic, with multi-strategy voting) ===
+        if sr is None:
+            log("recognize_audio: neither Whisper nor SpeechRecognition available", "ERROR")
+            return None
+        log("[Google Speech] falling back to Google Speech API (less accurate)")
+        results = []
         recognizer = sr.Recognizer()
-        # Try multiple strategies to improve recognition accuracy
         strategies = [
             {"name": "dynamic-0.5s", "dynamic_energy": True, "adjust_duration": 0.5, "show_all": False},
             {"name": "fixed-300", "dynamic_energy": False, "adjust_duration": 1.0, "show_all": False},
@@ -935,7 +1011,7 @@ def recognize_audio(mp3_path):
                         recognizer.adjust_for_ambient_noise(src, duration=strat["adjust_duration"])
                     else:
                         recognizer.dynamic_energy_threshold = False
-                        recognizer.energy_threshold = 300  # fixed threshold for quiet audio
+                        recognizer.energy_threshold = 300
                     audio_data = recognizer.record(src)
                     if strat["show_all"]:
                         alternatives = recognizer.recognize_google(audio_data, show_all=True)
@@ -943,7 +1019,6 @@ def recognize_audio(mp3_path):
                             alts = alternatives.get('alternative', [])
                             for alt_i, alt in enumerate(alts[:3]):
                                 log(f"  alt[{alt_i}]: '{alt.get('transcript', '')}' (conf={alt.get('confidence', 0):.2f})")
-                            # Pick the alternative with highest confidence
                             best = None
                             best_conf = 0
                             for alt in alts:
@@ -969,38 +1044,32 @@ def recognize_audio(mp3_path):
             except Exception as e:
                 log(f"recognize_audio: strategy '{strat['name']}' error: {e}", "WARN")
                 continue
+        
+        if not results:
+            return None
+        # Multi-strategy voting (same as before)
+        from collections import Counter
+        def norm(s):
+            return ' '.join(s.lower().split())
+        counter = Counter()
+        conf_sum = {}
+        for text, conf in results:
+            n = norm(text)
+            if not n:
+                continue
+            counter[n] += 1
+            conf_sum[n] = conf_sum.get(n, 0) + (conf if conf else 0.5)
+        if not counter:
+            return None
+        best_key = max(counter, key=lambda k: (counter[k], conf_sum[k]))
+        log(f"recognize_audio: voted {len(results)} results → '{best_key}' "
+            f"(votes={counter[best_key]}, conf_sum={conf_sum[best_key]:.2f})")
+        return best_key
     finally:
         try:
             os.remove(wav_path)
         except Exception:
             pass
-
-    if not results:
-        return None
-    # 多策略投票: 同一文本被越多策略识别出一致结果就越可信。
-    # 实测日志显示 3/4 策略一致的文本通常正确, 而"只看最高 confidence"反而
-    # 会选到个别含拼写错误的结果(如 Kompany itself has / situation and be cut)。
-    from collections import Counter
-
-    def norm(s):
-        return ' '.join(s.lower().split())
-
-    counter = Counter()
-    conf_sum = {}
-    for text, conf in results:
-        n = norm(text)
-        if not n:
-            continue
-        counter[n] += 1
-        conf_sum[n] = conf_sum.get(n, 0) + (conf if conf else 0.5)
-
-    if not counter:
-        return None
-    # 出现次数优先, 次数相同取 confidence 总和更高者
-    best_key = max(counter, key=lambda k: (counter[k], conf_sum[k]))
-    log(f"recognize_audio: voted {len(results)} results → '{best_key}' "
-        f"(votes={counter[best_key]}, conf_sum={conf_sum[best_key]:.2f})")
-    return best_key
 
 
 def solve_recaptcha(page):
