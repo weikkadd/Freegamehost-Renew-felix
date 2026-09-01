@@ -1121,6 +1121,7 @@ def solve_recaptcha(page):
             log("bframe did not appear within 15s; proceeding to retry loop", "WARN")
 
     dl_fails = 0
+    silent_refusals = 0
     last_text = None
     same_text_streak = 0
     solve_start = time.time()
@@ -1155,6 +1156,25 @@ def solve_recaptcha(page):
                         # Invisible: try execute again, then wait longer for challenge
                         try_invoke_grecaptcha_execute(page)
                         time.sleep(3)
+                        # 静默拒绝检测: Google 风控对被标记的 IP/环境可能既不下发 challenge
+                        # 也不返回 token —— bframe 始终为空, switch_to_audio 永远失败。
+                        # 同 IP 上重试毫无意义, 连续 3 次即判定为 IP 被封, 触发换 IP 重试。
+                        silent_refusals += 1
+                        if silent_refusals == 1:
+                            try:
+                                tok_len = 0
+                                for fr in page.get_frames():
+                                    v = fr.run_js("return document.querySelector(\"textarea[name='g-recaptcha-response']\")?.value || ''")
+                                    if v:
+                                        tok_len = len(v)
+                                        break
+                                log(f"[diag] silent refusal: g-recaptcha-response len={tok_len}, url={page.url}", "WARN")
+                            except Exception:
+                                pass
+                        if silent_refusals >= 3:
+                            raise Exception(
+                                "IP blocked by Google reCAPTCHA: silent refusal "
+                                "(no challenge issued and no token, flagged IP or environment)")
                     else:
                         click_recaptcha_checkbox(page)
                         time.sleep(3)
@@ -1358,16 +1378,21 @@ def main():
     # Google reCAPTCHA 信任此类 IP, 音频验证能正常响应);
     # 无 WARP 时回退 PROXY_URI 机场节点(数据中心 IP, reCAPTCHA 软限制, 成功率低)
     warp_available = shutil.which("warp-cli") is not None
-    if warp_available:
+    # FGH_FORCE_PROXY=1 时跳过 WARP, 强制走 PROXY_URI 机场节点(测试节点 IP 信誉用)
+    force_proxy = os.environ.get("FGH_FORCE_PROXY", "").strip().lower() in ("1", "true", "yes")
+    using_warp = warp_available and not force_proxy
+    if using_warp:
         log("✅ 检测到 WARP (warp-cli), 使用系统级 VPN — Chrome 无需代理")
         get_warp_manager().record_initial_ip()
+    elif warp_available and force_proxy:
+        log("FGH_FORCE_PROXY=1 — 跳过 WARP, Chrome 走 PROXY_URI 机场节点代理", "WARN")
     else:
         log("⚠️ 未检测到 warp-cli, 回退使用 PROXY_URI 机场节点代理", "WARN")
 
     # Initialize proxy manager and start first proxy if PROXY_URI is set
     proxy_active = init_proxy_manager()
     proxy_url = None
-    if proxy_active and not warp_available:
+    if proxy_active and not using_warp:
         if _proxy_manager.start(0):
             proxy_url = _proxy_manager.get_socks5_url()
             log(f"Browser will use proxy: {proxy_url}")
@@ -1486,6 +1511,11 @@ def main():
                             log(f"reCAPTCHA IP blocked, will rotate proxy and retry", "WARN")
                             page.get_screenshot(f"{SCREENSHOT_DIR}/error_captcha_blocked_{ip_attempt+1}.png")
                             ip_blocked = True
+                        elif using_warp and "Max captcha attempts reached" in err_str:
+                            # WARP 模式换 IP 成本极低, 识别耗尽也轮换 IP 重试而不是直接失败
+                            log("reCAPTCHA solve attempts exhausted — WARP mode: rotating IP and retrying", "WARN")
+                            page.get_screenshot(f"{SCREENSHOT_DIR}/error_captcha_blocked_{ip_attempt+1}.png")
+                            ip_blocked = True
                         else:
                             error_msg = f"reCAPTCHA solve failed: {e}"
                             log(f"ERROR: {error_msg}", "ERROR")
@@ -1493,7 +1523,7 @@ def main():
                             raise
 
             if ip_blocked:
-                if warp_available:
+                if using_warp:
                     # WARP 模式: 轮换 WARP IP(出口为 Cloudflare 消费者 IP, reCAPTCHA 信任)
                     if ip_attempt + 1 >= MAX_IP_ROTATIONS:
                         error_msg = "Max WARP IP rotations reached, Google reCAPTCHA still blocking"

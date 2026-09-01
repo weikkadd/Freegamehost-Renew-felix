@@ -15,6 +15,8 @@ jobs:
     timeout-minutes: 30
     env:
       PROXY_URI: ${{ secrets.PROXY_URI }}
+      # 仓库 Variable 里配 FGH_FORCE_PROXY=1 可跳过 WARP 强制走 PROXY_URI 节点
+      FGH_FORCE_PROXY: ${{ vars.FGH_FORCE_PROXY || '' }}
 
     steps:
       - name: 📥 检出仓库代码
