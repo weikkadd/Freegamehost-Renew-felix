@@ -59,7 +59,7 @@ RELOAD_TIMEOUT_S = 15          # Max total time for reload_challenge to complete
 SWITCH_AUDIO_TIMEOUT_S = 12    # Max total time for switch_to_audio
 GET_AUDIO_URL_TIMEOUT_S = 6    # Max total time for get_audio_url polling
 ATTEMPT_TIMEOUT_S = 60         # Max time for a single solve_recaptcha attempt
-SOLVE_TOTAL_TIMEOUT_S = 480    # Max total time for solve_recaptcha (8 min)
+SOLVE_TOTAL_TIMEOUT_S = 240    # Max total time for solve_recaptcha (4 min)
 
 
 class BlockedError(Exception):
@@ -91,11 +91,17 @@ class WarpManager:
         return result
 
     def _get_current_ip(self):
+        # ipify 只返回 IPv4: WARP 重新注册后 v4 出口往往不变而 v6 出口变化,
+        # 用 cloudflare trace 取真实出口(可能是 v4 或 v6),
+        # 否则去重逻辑永远误判"重复 IP", 每次轮换白耗 8 次尝试
         try:
             r = subprocess.run(
-                ["curl", "-s", "--max-time", "15", "https://api.ipify.org"],
+                ["curl", "-s", "--max-time", "15", "https://www.cloudflare.com/cdn-cgi/trace"],
                 capture_output=True, text=True, timeout=20)
-            return r.stdout.strip()
+            for line in r.stdout.splitlines():
+                if line.startswith("ip="):
+                    return line.split("=", 1)[1].strip()
+            return r.stdout.strip() or ""
         except Exception:
             return ""
 
@@ -1122,6 +1128,7 @@ def solve_recaptcha(page):
 
     dl_fails = 0
     silent_refusals = 0
+    stuck_verifies = 0
     last_text = None
     same_text_streak = 0
     solve_start = time.time()
@@ -1279,6 +1286,15 @@ def solve_recaptcha(page):
         
         if not reload_ok:
             log("All 2 reload attempts failed to change audio URL", "WARN")
+            # 验证按钮卡死 + reload 出不了新题 = Google 对该出口的音频通道软封锁:
+            # 答案不判对错、按钮永 disabled、challenge 不刷新。继续耗下去毫无意义,
+            # 连续 2 次直接判定 IP 被封触发轮换。
+            stuck_verifies += 1
+            log(f"Audio channel soft-block signal {stuck_verifies}/2", "WARN")
+            if stuck_verifies >= 2:
+                raise Exception(
+                    "IP blocked by Google reCAPTCHA: audio channel soft-blocked "
+                    "(verify button stuck disabled, challenge cannot refresh)")
             # Last resort: trigger execute() to start fresh
             try_invoke_grecaptcha_execute(page)
             time.sleep(3)
@@ -1286,6 +1302,7 @@ def solve_recaptcha(page):
                 switch_to_audio(page)
             time.sleep(random.uniform(1, 2))
         else:
+            stuck_verifies = 0
             time.sleep(random.uniform(1.5, 3))
 
     raise RuntimeError("Max captcha attempts reached")
